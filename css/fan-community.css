@@ -1,0 +1,993 @@
+/* css/fan-community.css — 同好社区（韩系奶油极简风）
+ * 严格限定于 #fan-community-page 作用域，绝不污染弯弯机其他页面样式。
+ */
+
+#fan-community-page.full-page,
+:root.theme-dark #app #fan-community-page.full-page {
+  --fc-cream: #f9f7f2;
+  --fc-paper: #fffefa;
+  --fc-ink: #393b35;
+  --fc-muted: #92948b;
+  --fc-sub: #96988e;
+  --fc-line: #eae7de;
+  --fc-card-line: #eae8e0;
+  --fc-accent: #8d9a84;
+  --fc-accent-deep: #596957;
+  --fc-accent-btn: #7d8d76;
+  --fc-warm: #e9e7dc;
+  --fc-symbol-bg: #f1f2ec;
+  --fc-safe-top: env(safe-area-inset-top, 0px);
+  --fc-safe-bottom: max(env(safe-area-inset-bottom, 0px), var(--android-bottom-inset, 0px));
+  z-index: 66;
+  background: #f1f0ea;
+  color: var(--fc-ink);
+  height: 100%;
+  height: 100dvh;
+  max-height: 100dvh;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  color-scheme: light;
+  font-family: -apple-system, BlinkMacSystemFont, "Pretendard", "Noto Sans KR", "PingFang SC", sans-serif;
+}
+
+#fan-community-page.full-page.is-closing,
+:root.theme-dark #app #fan-community-page.full-page.is-closing {
+  pointer-events: none;
+}
+
+.fc-close-shield {
+  position: absolute;
+  inset: 0;
+  z-index: 65;
+  background: transparent;
+  pointer-events: auto;
+}
+
+#fan-community-page *,
+#fan-community-page *::before,
+#fan-community-page *::after {
+  box-sizing: border-box;
+}
+
+#fan-community-page button {
+  font: inherit;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+#fan-community-page button:focus-visible {
+  outline: 2px solid var(--fc-accent);
+  outline-offset: 2px;
+}
+
+.fc-frame {
+  position: relative;
+  width: 100%;
+  max-width: 540px;
+  height: 100%;
+  min-height: 0;
+  background: var(--fc-cream);
+  color: var(--fc-ink);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.fc-main {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+  padding: 12px 22px calc(98px + var(--fc-safe-bottom));
+}
+
+.fc-topbar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  padding: calc(10px + var(--fc-safe-top)) 20px 8px;
+  min-height: 52px;
+  background: var(--fc-cream);
+  border-bottom: 1px solid var(--fc-line);
+  z-index: 4;
+}
+
+.fc-brand-home-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 44px;
+  padding: 6px 10px 6px 2px;
+  border: 0;
+  border-radius: 12px;
+  background: transparent;
+  color: var(--fc-ink);
+  text-align: left;
+  transition: opacity 0.14s ease, transform 0.14s ease, background-color 0.14s ease;
+}
+
+.fc-brand-home-btn:hover {
+  opacity: 0.84;
+}
+
+.fc-brand-home-btn:active {
+  transform: scale(0.98);
+  background: rgba(141, 154, 132, 0.12);
+}
+
+.fc-brand-home-title {
+  font-size: 21px;
+  letter-spacing: -0.6px;
+  font-weight: 650;
+  color: var(--fc-ink);
+  line-height: 1.2;
+}
+
+.fc-brand-home-mark {
+  font-size: 15px;
+  line-height: 1;
+  color: var(--fc-accent);
+}
+
+#fan-community-page .fc-topbar-plain-title {
+  margin: 0;
+  min-height: 44px;
+  display: inline-flex;
+  align-items: center;
+  font-size: 21px;
+  letter-spacing: -0.6px;
+  font-weight: 650;
+  color: var(--fc-ink);
+  line-height: 1.2;
+}
+
+.fc-view[hidden] {
+  display: none;
+}
+
+.fc-eyebrow {
+  font-size: 10px;
+  color: #9a9d91;
+  letter-spacing: 2.5px;
+  font-weight: 600;
+  margin-top: 6px;
+}
+
+.fc-heading {
+  font-size: 32px;
+  letter-spacing: -1.4px;
+  font-weight: 650;
+  margin: 12px 0 10px;
+  color: var(--fc-ink);
+  line-height: 1.2;
+}
+
+.fc-desc {
+  font-size: 13px;
+  color: #96968e;
+  line-height: 1.8;
+  margin: 0 0 26px;
+}
+
+.fc-card-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.fc-entry-card {
+  width: 100%;
+  background: var(--fc-paper);
+  border: 1px solid var(--fc-card-line);
+  border-radius: 17px;
+  box-shadow: 0 3px 14px rgba(53, 57, 44, 0.025);
+  color: var(--fc-ink);
+  padding: 23px 20px;
+  min-height: 123px;
+  text-align: left;
+  display: block;
+  position: relative;
+  transition: transform 0.14s ease, background-color 0.14s ease, border-color 0.14s ease;
+}
+
+.fc-entry-card::after {
+  content: "↗";
+  position: absolute;
+  right: 21px;
+  top: 23px;
+  color: #a7aca2;
+  font-size: 18px;
+  font-weight: 300;
+}
+
+.fc-entry-card:active {
+  transform: scale(0.992);
+  background: #f7f6f0;
+  border-color: #dfe2d7;
+}
+
+.fc-symbol {
+  display: inline-flex;
+  width: 36px;
+  height: 36px;
+  align-items: center;
+  justify-content: center;
+  font-size: 19px;
+  border-radius: 11px;
+  background: var(--fc-symbol-bg);
+  filter: saturate(0.65);
+}
+
+.fc-card-title {
+  display: block;
+  font-size: 18px;
+  letter-spacing: -0.35px;
+  margin: 10px 0 5px;
+  font-weight: 650;
+  color: var(--fc-ink);
+}
+
+.fc-card-desc {
+  display: block;
+  font-size: 12px;
+  color: var(--fc-sub);
+  line-height: 1.6;
+}
+
+.fc-foot {
+  font-size: 11px;
+  color: #b0b0a7;
+  text-align: center;
+  margin-top: 23px;
+}
+
+/* 存档 / 设置占位布局（任务 02 仅保留导航视觉骨架，不含业务逻辑） */
+.fc-page-heading {
+  margin-top: 18px;
+  margin-bottom: 20px;
+}
+
+.fc-page-heading small {
+  display: block;
+  font-size: 10px;
+  letter-spacing: 2px;
+  color: #9a9d91;
+  font-weight: 600;
+}
+
+.fc-page-heading h2 {
+  font-size: 27px;
+  margin: 10px 0;
+  letter-spacing: -0.6px;
+  color: var(--fc-ink);
+  font-weight: 650;
+}
+
+.fc-page-heading p {
+  color: var(--fc-muted);
+  font-size: 13px;
+  line-height: 1.8;
+  margin: 0;
+}
+
+.fc-panel-card {
+  background: var(--fc-paper);
+  border: 1px solid var(--fc-line);
+  border-radius: 16px;
+  padding: 18px;
+  margin: 14px 0;
+}
+
+.fc-panel-card h3 {
+  font-size: 16px;
+  margin: 0 0 10px;
+  color: var(--fc-ink);
+  font-weight: 600;
+}
+
+.fc-panel-card p {
+  color: #999d92;
+  font-size: 13px;
+  line-height: 1.8;
+  margin: 0;
+}
+
+/* 底部三标签导航 */
+.fc-nav {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  height: calc(69px + var(--fc-safe-bottom));
+  padding: 7px 12px calc(7px + var(--fc-safe-bottom));
+  display: flex;
+  justify-content: space-around;
+  align-items: center;
+  background: rgba(255, 254, 250, 0.96);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  border-top: 1px solid var(--fc-line);
+  box-shadow: 0 -3px 14px rgba(67, 69, 56, 0.03);
+  z-index: 5;
+}
+
+.fc-nav-btn {
+  border: 0;
+  background: none;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  color: #a8aaa1;
+  font-size: 11px;
+  min-width: 85px;
+  padding: 4px 8px;
+  transition: color 0.14s ease;
+}
+
+.fc-nav-icon {
+  font-size: 22px;
+  line-height: 26px;
+}
+
+.fc-nav-btn.nav-active {
+  color: var(--fc-accent-deep);
+  font-weight: 700;
+}
+
+.fc-nav-btn.nav-active .fc-nav-icon {
+  color: var(--fc-accent);
+}
+
+/* 社区设置 -> 公共人设库入口卡 */
+.fc-settings-entry-card {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 16px;
+  margin: 14px 0;
+  background: var(--fc-paper);
+  border: 1px solid #dfe4d7;
+  border-radius: 17px;
+  box-shadow: 0 3px 14px rgba(53, 57, 44, 0.03);
+  color: var(--fc-ink);
+  text-align: left;
+  transition: transform 0.14s ease, background-color 0.14s ease, border-color 0.14s ease;
+}
+
+.fc-settings-entry-card:active {
+  transform: scale(0.992);
+  background: #f5f6f0;
+  border-color: #cfd8c7;
+}
+
+.fc-settings-entry-icon {
+  width: 42px;
+  height: 42px;
+  flex: none;
+  border-radius: 12px;
+  background: #eef3ea;
+  border: 1px solid #dde6d6;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 20px;
+  filter: saturate(0.7);
+}
+
+.fc-settings-entry-main {
+  flex: 1;
+  min-width: 0;
+}
+
+.fc-settings-entry-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
+.fc-settings-entry-title {
+  font-size: 16px;
+  font-weight: 650;
+  color: var(--fc-ink);
+  letter-spacing: -0.2px;
+}
+
+.fc-settings-entry-badge {
+  flex: none;
+  font-size: 11px;
+  font-weight: 600;
+  color: #5b6d56;
+  background: #eef3ea;
+  border: 1px solid #d5e0cf;
+  border-radius: 7px;
+  padding: 2px 8px;
+  line-height: 1.35;
+}
+
+.fc-settings-entry-desc {
+  margin: 0;
+  font-size: 12px;
+  color: var(--fc-muted);
+  line-height: 1.55;
+}
+
+.fc-settings-entry-arrow {
+  flex: none;
+  font-size: 21px;
+  line-height: 1;
+  color: #9ba598;
+  font-weight: 300;
+}
+
+/* 同好社区 · 公共人设库（韩系奶油极简风） */
+#fan-community-page .fc-persona-app {
+  position: relative;
+  height: 100%;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--fc-cream);
+  color: var(--fc-ink);
+  overflow: hidden;
+}
+
+#fan-community-page .fc-persona-search-wrap {
+  flex: none;
+  padding: 10px 14px 4px;
+  background: var(--fc-cream);
+}
+
+#fan-community-page .fc-persona-search-box {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--fc-paper);
+  border: 1px solid #e2e6db;
+  border-radius: 12px;
+  padding: 4px 8px 4px 12px;
+}
+
+#fan-community-page .fc-persona-search-box:focus-within {
+  border-color: #aebfa8;
+}
+
+#fan-community-page .fc-persona-search-input {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  background: transparent;
+  color: var(--fc-ink);
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.4;
+  padding: 6px 0;
+  outline: 0;
+}
+
+#fan-community-page .fc-persona-search-input::placeholder {
+  color: #9ea398;
+}
+
+#fan-community-page .fc-persona-search-clear {
+  flex: none;
+  width: 24px;
+  height: 24px;
+  border: 0;
+  border-radius: 50%;
+  background: #eceee7;
+  color: #6b7267;
+  font-size: 15px;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+}
+
+#fan-community-page .fc-persona-search-clear[hidden] {
+  display: none;
+}
+
+#fan-community-page .fc-persona-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+#fan-community-page .fc-persona-card {
+  background: var(--fc-paper);
+  border: 1px solid #e7e8de;
+  border-radius: 16px;
+  padding: 14px;
+  box-shadow: 0 2px 10px rgba(55, 62, 50, 0.025);
+  display: flex;
+  flex-direction: column;
+  gap: 11px;
+}
+
+#fan-community-page .fc-persona-card-top {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+}
+
+#fan-community-page .fc-persona-avatar {
+  width: 48px;
+  height: 48px;
+  flex: none;
+  border-radius: 14px;
+  background: linear-gradient(135deg, #c6d5c4, #a9bda7);
+  border: 1px solid rgba(114, 134, 113, 0.16);
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+#fan-community-page .fc-persona-avatar::after {
+  content: "角";
+  font-size: 16px;
+  font-weight: 600;
+  color: rgba(255, 254, 250, 0.85);
+}
+
+#fan-community-page .fc-persona-avatar.has-img::after {
+  display: none;
+}
+
+#fan-community-page .fc-persona-avatar img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+#fan-community-page .fc-persona-info {
+  flex: 1;
+  min-width: 0;
+}
+
+#fan-community-page .fc-persona-name-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 4px;
+}
+
+#fan-community-page .fc-persona-name {
+  font-size: 15px;
+  font-weight: 650;
+  color: var(--fc-ink);
+  word-break: break-word;
+}
+
+#fan-community-page .fc-persona-ref-meta {
+  font-size: 10px;
+  font-weight: 600;
+  color: #566952;
+  background: #edf3ea;
+  border: 1px solid #d1decb;
+  border-radius: 6px;
+  padding: 1px 6px;
+  line-height: 1.4;
+}
+
+#fan-community-page .fc-persona-summary {
+  margin: 0 0 5px;
+  font-size: 12px;
+  line-height: 1.55;
+  color: #6f756a;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  word-break: break-word;
+}
+
+#fan-community-page .fc-persona-meta {
+  font-size: 11px;
+  color: #9ba096;
+}
+
+#fan-community-page .fc-persona-card-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  padding-top: 9px;
+  border-top: 1px dashed #ecebe3;
+}
+
+#fan-community-page .fc-persona-delete-btn {
+  border: 1px solid #ecd6d6;
+  background: #fdf6f6;
+  color: #a45b5d;
+  border-radius: 9px;
+  padding: 5px 11px;
+  font-size: 12px;
+  line-height: 1.2;
+}
+
+#fan-community-page .fc-persona-delete-btn:active {
+  background: #fae8e8;
+}
+
+#fan-community-page .fc-persona-editor-panel {
+  z-index: 26;
+}
+
+#fan-community-page .fc-persona-upload-label {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+
+#fan-community-page .fc-persona-confirm-sub {
+  margin: 4px 0 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: #7b8278;
+}
+
+#fan-community-page .fc-persona-ref-meta.is-lorebook {
+  background: #f5f2e8;
+  border-color: #e4decb;
+  color: #6e6447;
+}
+
+/* 公共人设 · 世界书挂载区（韩系奶油极简风） */
+#fan-community-page .fc-persona-lb-global-box {
+  background: #f7f6f0;
+  border: 1px solid #e7e6dc;
+  border-radius: 12px;
+  padding: 11px 12px;
+  margin-bottom: 12px;
+}
+
+#fan-community-page .fc-persona-lb-row-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 5px;
+}
+
+#fan-community-page .fc-persona-lb-subtitle {
+  font-size: 13px;
+  font-weight: 650;
+  color: var(--fc-ink);
+}
+
+#fan-community-page .fc-persona-lb-desc {
+  margin: 0;
+  font-size: 11.5px;
+  line-height: 1.55;
+  color: #7c8075;
+}
+
+#fan-community-page .fc-persona-lb-local-head {
+  margin-bottom: 8px;
+}
+
+#fan-community-page .fc-persona-lb-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+#fan-community-page .fc-persona-lb-empty {
+  padding: 12px;
+  border-radius: 12px;
+  border: 1px dashed #deded2;
+  background: #fcfbf7;
+  font-size: 12px;
+  line-height: 1.55;
+  color: #8f9387;
+  text-align: center;
+}
+
+#fan-community-page .fc-persona-lb-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 12px;
+  background: #fcfbf7;
+  border: 1px solid #e7e6dc;
+  border-radius: 12px;
+}
+
+#fan-community-page .fc-persona-lb-item.is-stale {
+  border-color: #ecd9d5;
+  background: #fdf8f7;
+}
+
+#fan-community-page .fc-persona-lb-item-main {
+  flex: 1;
+  min-width: 0;
+}
+
+#fan-community-page .fc-persona-lb-item-title-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 3px;
+}
+
+#fan-community-page .fc-persona-lb-item-name {
+  font-size: 13px;
+  font-weight: 650;
+  color: var(--fc-ink);
+  word-break: break-word;
+}
+
+#fan-community-page .fc-persona-lb-item-meta {
+  font-size: 11px;
+  line-height: 1.45;
+  color: #888c81;
+}
+
+#fan-community-page .fc-persona-lb-status-pill {
+  flex: none;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1.3;
+  padding: 2px 6px;
+  border-radius: 6px;
+  border: 1px solid transparent;
+}
+
+#fan-community-page .fc-persona-lb-status-pill.is-auto {
+  background: #eff2eb;
+  border-color: #dbe2d4;
+  color: #5d6a58;
+}
+
+#fan-community-page .fc-persona-lb-status-pill.is-enabled {
+  background: #eef4ec;
+  border-color: #d4e2d0;
+  color: #536e4d;
+}
+
+#fan-community-page .fc-persona-lb-status-pill.is-disabled {
+  background: #f3f2ec;
+  border-color: #e3e1d6;
+  color: #88897e;
+}
+
+#fan-community-page .fc-persona-lb-status-pill.is-warn {
+  background: #fcf0ee;
+  border-color: #edd0cb;
+  color: #a45b58;
+}
+
+#fan-community-page .fc-persona-lb-unbind-btn {
+  flex: none;
+  border: 1px solid #e3e2d8;
+  background: #ffffff;
+  color: #6f7468;
+  border-radius: 9px;
+  padding: 5px 10px;
+  font-size: 11.5px;
+  line-height: 1.2;
+}
+
+#fan-community-page .fc-persona-lb-unbind-btn:active {
+  background: #f1f0ea;
+}
+
+#fan-community-page .fc-persona-lb-picker-tip {
+  margin: 0 0 10px;
+}
+
+#fan-community-page .fc-persona-lb-picker-search-wrap {
+  margin-bottom: 10px;
+}
+
+#fan-community-page .fc-persona-lb-picker-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 44vh;
+  overflow-y: auto;
+  padding-right: 2px;
+}
+
+#fan-community-page .fc-persona-lb-picker-empty {
+  padding: 18px 12px;
+  text-align: center;
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: #8e9287;
+  background: #f9f8f2;
+  border: 1px dashed #e2e1d7;
+  border-radius: 12px;
+}
+
+#fan-community-page .fc-persona-lb-option {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 11px 12px;
+  border-radius: 12px;
+  border: 1px solid #e5e5dc;
+  background: #fcfbf7;
+  color: var(--fc-ink);
+  text-align: left;
+  transition: background-color 0.14s ease, border-color 0.14s ease;
+}
+
+#fan-community-page .fc-persona-lb-option.is-selected {
+  background: #f2f5ee;
+  border-color: #b4c3ac;
+}
+
+#fan-community-page .fc-persona-lb-check {
+  width: 20px;
+  height: 20px;
+  flex: none;
+  border-radius: 6px;
+  border: 1.5px solid #c5cbbf;
+  background: #ffffff;
+  color: #ffffff;
+  font-size: 12px;
+  font-weight: 700;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+#fan-community-page .fc-persona-lb-option.is-selected .fc-persona-lb-check {
+  background: #7d8d76;
+  border-color: #7d8d76;
+  color: #ffffff;
+}
+
+#fan-community-page .fc-persona-lb-option-main {
+  flex: 1;
+  min-width: 0;
+}
+
+/* 同好社区「存档」列表样式 */
+#fan-community-page .fc-archive-summary-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 12px;
+  color: #7d8378;
+  padding: 2px 4px 10px;
+}
+
+#fan-community-page .fc-archive-summary-bar strong {
+  font-size: 12px;
+  color: #5b6d56;
+  font-weight: 600;
+}
+
+#fan-community-page .fc-archive-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+#fan-community-page .fc-archive-card {
+  background: #fffefa;
+  border: 1px solid #eae8e0;
+  border-radius: 17px;
+  overflow: hidden;
+  box-shadow: 0 3px 12px rgba(53, 57, 44, 0.03);
+}
+
+#fan-community-page .fc-archive-card-main {
+  width: 100%;
+  border: 0;
+  background: transparent;
+  padding: 15px 16px 12px;
+  text-align: left;
+  color: inherit;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  cursor: pointer;
+}
+
+#fan-community-page .fc-archive-card-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+#fan-community-page .fc-archive-cat-tag {
+  font-size: 11px;
+  font-weight: 600;
+  color: #6c7c66;
+}
+
+#fan-community-page .fc-archive-done-tag {
+  font-size: 10px;
+  font-weight: 600;
+  color: #4d6747;
+  background: #e6f0e2;
+  border: 1px solid #c9dcc2;
+  border-radius: 6px;
+  padding: 1px 7px;
+}
+
+#fan-community-page .fc-archive-card-title {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 700;
+  color: #353832;
+  line-height: 1.35;
+}
+
+#fan-community-page .fc-archive-card-meta {
+  font-size: 11.5px;
+  color: #888d82;
+}
+
+#fan-community-page .fc-archive-card-excerpt {
+  margin: 2px 0 0;
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: #676c62;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+#fan-community-page .fc-archive-card-ops {
+  display: flex;
+  gap: 7px;
+  padding: 10px 14px 12px;
+  border-top: 1px dashed #ebe8df;
+  background: #fbfaf5;
+}
+
+#fan-community-page .fc-archive-op-btn {
+  flex: 1;
+  border: 1px solid #dfe4da;
+  background: #fffefa;
+  color: #556352;
+  border-radius: 10px;
+  padding: 7px 6px;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+#fan-community-page .fc-archive-op-btn.primary {
+  background: #7d8d76;
+  border-color: #7d8d76;
+  color: #ffffff;
+  font-weight: 600;
+}
+
+#fan-community-page .fc-archive-op-btn.danger {
+  flex: 0.7;
+  background: #fdf5f5;
+  border-color: #edd5d5;
+  color: #b45a5d;
+}
+
+.fc-ext-btn.fc-ext-btn-danger {
+  background: #b56567;
+  color: #ffffff;
+}
+
+
