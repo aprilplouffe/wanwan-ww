@@ -1376,32 +1376,79 @@
     return _state.activeChat;
   }
 
+  function triggerBackgroundMemoryQueue(effectiveApi) {
+    if (!M() || typeof M().processMemoryTaskQueue !== 'function') return;
+    M().processMemoryTaskQueue(effectiveApi).then(function(qRes) {
+      if (!qRes) return;
+      if (Array.isArray(qRes.summarizedChats) && _state.activeChat) {
+        var matchedSum = qRes.summarizedChats.find(function(c) { return c && c.id === _state.activeChat.id; });
+        if (matchedSum) {
+          _state.activeChat.summary = matchedSum.summary || '';
+          _state.activeChat.summaryUpToCount = matchedSum.summaryUpToCount || 0;
+          _state.activeChat.summaryUpdatedAt = matchedSum.summaryUpdatedAt || 0;
+        }
+      }
+      var addedCount = qRes.addedCount || 0;
+      var updatedCount = qRes.updatedCount || 0;
+      if (addedCount > 0 || updatedCount > 0) {
+        syncSidebarMemoryBadge(document.getElementById(PAGE_ID));
+        notifyToast('已自动记住 ' + (addedCount + updatedCount) + ' 条长期记忆');
+      }
+    }).catch(function(err) {
+      console.warn('[AiWorkspace] background memory queue error:', err && err.message ? err.message : err);
+    });
+  }
+
   async function executeStreamingTurn(page, historyBeforeTurn, userText, assistantMsg, effectiveApi, turnOpts) {
     var preset = resolveEffectivePresetForState();
     var personalization = _state.personalization || (S() ? await S().getPersonalization() : null);
 
-    var relevantMemories = [];
-    if (M() && typeof M().retrieveRelevantMemories === 'function') {
+    var memContext = {
+      memories: [],
+      crossChatContexts: [],
+      shortTermSummary: '',
+      summaryUpToCount: 0,
+      useShortTermHistory: true,
+      maxRecentMessages: 14
+    };
+    if (M() && typeof M().retrieveWorkspaceContext === 'function') {
       try {
-        relevantMemories = await M().retrieveRelevantMemories({
+        memContext = await M().retrieveWorkspaceContext({
+          query: userText,
+          historyMessages: historyBeforeTurn,
+          activeChat: _state.activeChat,
+          chatId: _state.activeChat ? _state.activeChat.id : '',
+          projectId: (_state.activeChat && _state.activeChat.projectId) || '',
+          apiConfig: effectiveApi,
+          userId: 'local_user'
+        });
+      } catch (memErr) {
+        console.warn('[AiWorkspace] workspace context retrieval skipped:', memErr);
+      }
+    } else if (M() && typeof M().retrieveRelevantMemories === 'function') {
+      try {
+        memContext.memories = await M().retrieveRelevantMemories({
           query: userText,
           historyMessages: historyBeforeTurn,
           chatId: _state.activeChat ? _state.activeChat.id : '',
           projectId: (_state.activeChat && _state.activeChat.projectId) || '',
           userId: 'local_user'
         });
-      } catch (memErr) {
-        console.warn('[AiWorkspace] memory retrieval skipped:', memErr);
-        relevantMemories = [];
+      } catch (memErrFallback) {
+        console.warn('[AiWorkspace] memory retrieval skipped:', memErrFallback);
       }
     }
 
     var composed = AI().composeMessages({
-      historyMessages: historyBeforeTurn,
+      historyMessages: memContext.useShortTermHistory ? historyBeforeTurn : [],
+      shortTermSummary: memContext.shortTermSummary || '',
+      summaryUpToCount: memContext.summaryUpToCount || 0,
+      maxRecentMessages: memContext.maxRecentMessages || 14,
       userContent: userText,
       personalization: personalization,
       preset: preset,
-      memories: relevantMemories,
+      memories: memContext.memories || [],
+      crossChatContexts: memContext.crossChatContexts || [],
       deepThink: _state.deepThinkEnabled
     });
 
@@ -1450,29 +1497,47 @@
       await persistCurrentChatMessages();
     }
 
-    if (
-      completedNormally &&
-      !(turnOpts && turnOpts.skipAutoMemory) &&
-      M() &&
-      typeof M().extractAndSaveFromTurn === 'function'
-    ) {
-      M().extractAndSaveFromTurn({
-        userText: userText,
-        assistantText: assistantMsg.content,
-        chatId: _state.activeChat ? _state.activeChat.id : '',
-        chatTitle: _state.activeChat ? _state.activeChat.title : '',
-        projectId: (_state.activeChat && _state.activeChat.projectId) || '',
-        apiConfig: effectiveApi,
-        userId: 'local_user'
-      }).then(function(memRes) {
-        if (!memRes) return;
-        var addedCount = memRes.added ? memRes.added.length : 0;
-        var updatedCount = memRes.updated ? memRes.updated.length : 0;
-        if (addedCount > 0 || updatedCount > 0) {
-          syncSidebarMemoryBadge(document.getElementById(PAGE_ID));
-          notifyToast('已自动记住 ' + (addedCount + updatedCount) + ' 条长期记忆');
+    if (completedNormally && M()) {
+      var turnChatId = _state.activeChat ? _state.activeChat.id : '';
+      var turnChatTitle = _state.activeChat ? _state.activeChat.title : '';
+      var turnProjectId = (_state.activeChat && _state.activeChat.projectId) || '';
+      var skipAutoMem = !!(turnOpts && turnOpts.skipAutoMemory);
+
+      if (typeof M().enqueueTurnMemoryTasks === 'function' && typeof M().processMemoryTaskQueue === 'function') {
+        try {
+          await M().enqueueTurnMemoryTasks({
+            userMsgId: (turnOpts && turnOpts.userMsgId) || '',
+            userText: userText,
+            assistantText: assistantMsg.content,
+            chatId: turnChatId,
+            chatTitle: turnChatTitle,
+            projectId: turnProjectId,
+            userId: 'local_user',
+            skipAutoMemory: skipAutoMem
+          });
+          triggerBackgroundMemoryQueue(effectiveApi);
+        } catch (queueErr) {
+          console.warn('[AiWorkspace] enqueue memory tasks failed:', queueErr);
         }
-      }).catch(function() {});
+      } else if (!skipAutoMem && typeof M().extractAndSaveFromTurn === 'function') {
+        M().extractAndSaveFromTurn({
+          userText: userText,
+          assistantText: assistantMsg.content,
+          chatId: turnChatId,
+          chatTitle: turnChatTitle,
+          projectId: turnProjectId,
+          apiConfig: effectiveApi,
+          userId: 'local_user'
+        }).then(function(memRes) {
+          if (!memRes) return;
+          var addedCount = memRes.added ? memRes.added.length : 0;
+          var updatedCount = memRes.updated ? memRes.updated.length : 0;
+          if (addedCount > 0 || updatedCount > 0) {
+            syncSidebarMemoryBadge(document.getElementById(PAGE_ID));
+            notifyToast('已自动记住 ' + (addedCount + updatedCount) + ' 条长期记忆');
+          }
+        }).catch(function() {});
+      }
     }
   }
 
@@ -1547,7 +1612,7 @@
     syncComposerButtons(page);
     updateMainStage(page);
 
-    await executeStreamingTurn(page, historyBeforeTurn, text, assistantMsg, effective);
+    await executeStreamingTurn(page, historyBeforeTurn, text, assistantMsg, effective, { userMsgId: userMsg.id });
   }
 
   async function regenerateAtMessage(page, msgId) {
@@ -1820,6 +1885,9 @@
     syncContextStrip(page);
     updateMainStage(page);
     bindEvents(page);
+    if (_state.effectiveApi && _state.effectiveApi.configured) {
+      triggerBackgroundMemoryQueue(_state.effectiveApi);
+    }
   }
 
   global.showAiWorkspacePage = showAiWorkspacePage;

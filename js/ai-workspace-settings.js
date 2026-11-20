@@ -44,8 +44,9 @@
     presets: [],
     customApi: null,
     effectiveApi: null,
-    memorySettings: { useMemory: true, autoMemory: true },
+    memorySettings: { shortTermContext: true, crossChatMemory: true, useMemory: true, autoMemory: true },
     memories: [],
+    memoryTasks: [],
     memorySearchQuery: ''
   };
 
@@ -155,8 +156,11 @@
       store.getGeneralSettings(),
       store.listPresets(),
       store.getCustomApiConfig(),
-      typeof store.getMemorySettings === 'function' ? store.getMemorySettings() : Promise.resolve({ useMemory: true, autoMemory: true }),
-      typeof store.listMemories === 'function' ? store.listMemories() : Promise.resolve([])
+      typeof store.getMemorySettings === 'function'
+        ? store.getMemorySettings()
+        : Promise.resolve({ shortTermContext: true, crossChatMemory: true, useMemory: true, autoMemory: true }),
+      typeof store.listMemories === 'function' ? store.listMemories() : Promise.resolve([]),
+      typeof store.listMemoryTasks === 'function' ? store.listMemoryTasks() : Promise.resolve([])
     ]);
     _ctx.profile = results[0];
     _ctx.personalization = results[1];
@@ -164,8 +168,9 @@
     _ctx.general = results[3];
     _ctx.presets = results[4];
     _ctx.customApi = results[5];
-    _ctx.memorySettings = results[6] || { useMemory: true, autoMemory: true };
+    _ctx.memorySettings = results[6] || { shortTermContext: true, crossChatMemory: true, useMemory: true, autoMemory: true };
     _ctx.memories = results[7] || [];
+    _ctx.memoryTasks = results[8] || [];
     if (AI() && typeof AI().resolveEffectiveApiConfig === 'function') {
       _ctx.effectiveApi = await AI().resolveEffectiveApiConfig();
     }
@@ -267,9 +272,10 @@
     var apiStatusVal = customApi.complete
       ? ('专属 · ' + (customApi.model || '已配置'))
       : '使用主 API';
-    var memSettings = _ctx.memorySettings || { useMemory: true, autoMemory: true };
+    var memSettings = _ctx.memorySettings || { shortTermContext: true, crossChatMemory: true, useMemory: true, autoMemory: true };
     var memCount = (_ctx.memories || []).length;
-    var memorySummary = memSettings.useMemory ? (memCount + ' 条') : '已关闭';
+    var anyMemoryActive = !!(memSettings.shortTermContext || memSettings.crossChatMemory || memSettings.useMemory || memSettings.autoMemory);
+    var memorySummary = anyMemoryActive ? (memCount + ' 条') : '已关闭';
 
     return (
       '<div class="aiw-st-topbar">' +
@@ -1627,8 +1633,52 @@
     }).join('');
   }
 
+  function renderMemoryTasksHtml(tasks) {
+    var list = Array.isArray(tasks) ? tasks : [];
+    if (!list.length) return '';
+    var failedCount = list.filter(function(t) { return t && t.status === 'failed'; }).length;
+    var statusTextMap = {
+      pending: '等待中',
+      running: '处理中',
+      done: '已完成',
+      failed: '失败'
+    };
+    var rowsHtml = list.slice(0, 6).map(function(t) {
+      var typeLabel = t.type === 'summarize_chat' ? '短期摘要' : '自动提取';
+      var stLabel = statusTextMap[t.status] || t.status || '等待中';
+      var errLine = t.status === 'failed' && t.lastError
+        ? ('<div class="aiw-mem-task-err">' + escapeHtml(t.lastError) + '</div>')
+        : (t.resultSummary ? ('<div class="aiw-mem-task-sub">' + escapeHtml(t.resultSummary) + '</div>') : '');
+      return (
+        '<div class="aiw-mem-task-item is-' + escapeHtml(t.status || 'pending') + '">' +
+          '<div class="aiw-mem-task-top">' +
+            '<span class="aiw-mem-task-type">' + escapeHtml(typeLabel) + ' · ' + escapeHtml(t.chatTitle || '对话') + '</span>' +
+            '<span class="aiw-mem-task-badge is-' + escapeHtml(t.status || 'pending') + '">' + escapeHtml(stLabel) + (t.attempts ? (' (' + t.attempts + '次)') : '') + '</span>' +
+          '</div>' +
+          errLine +
+        '</div>'
+      );
+    }).join('');
+
+    return (
+      '<div class="aiw-st-group-title" style="margin-top:18px;">后台记忆与摘要任务</div>' +
+      '<div class="aiw-st-card aiw-st-pad" id="aiw-mem-task-panel">' +
+        '<div class="aiw-mem-task-head">' +
+          '<span class="aiw-pr-count">最近 ' + Math.min(6, list.length) + ' / 共 ' + list.length + ' 条任务' + (failedCount ? (' · ' + failedCount + ' 条失败') : '') + '</span>' +
+          '<div class="aiw-mem-task-btns">' +
+            (failedCount
+              ? '<button type="button" class="aiw-st-btn-secondary aiw-st-btn-sm" id="aiw-mem-retry-tasks"><i class="fa-solid fa-rotate-right"></i> 重试失败</button>'
+              : '') +
+            '<button type="button" class="aiw-st-btn-secondary aiw-st-btn-sm" id="aiw-mem-clear-tasks">清理已完成</button>' +
+          '</div>' +
+        '</div>' +
+        '<div class="aiw-mem-task-list">' + rowsHtml + '</div>' +
+      '</div>'
+    );
+  }
+
   function renderMemoryPageHtml() {
-    var ms = _ctx.memorySettings || { useMemory: true, autoMemory: true };
+    var ms = _ctx.memorySettings || { shortTermContext: true, crossChatMemory: true, useMemory: true, autoMemory: true };
     var allList = _ctx.memories || [];
     var filtered = getFilteredMemories();
 
@@ -1645,8 +1695,28 @@
         '<div class="aiw-st-card">' +
           '<div class="aiw-st-row aiw-st-row-static">' +
             '<div class="aiw-st-row-col">' +
+              '<div class="aiw-st-row-label">短期上下文</div>' +
+              '<div class="aiw-st-row-desc">自动保留近期原始对话，长对话自动压缩为阶段性摘要</div>' +
+            '</div>' +
+            '<label class="aiw-switch">' +
+              '<input type="checkbox" id="aiw-mem-short-toggle"' + (ms.shortTermContext !== false ? ' checked' : '') + '>' +
+              '<span class="aiw-switch-track"></span>' +
+            '</label>' +
+          '</div>' +
+          '<div class="aiw-st-row aiw-st-row-static">' +
+            '<div class="aiw-st-row-col">' +
+              '<div class="aiw-st-row-label">跨窗口记忆</div>' +
+              '<div class="aiw-st-row-desc">新建对话时自动参考其他聊天中的用户级记忆与相关上下文</div>' +
+            '</div>' +
+            '<label class="aiw-switch">' +
+              '<input type="checkbox" id="aiw-mem-cross-toggle"' + (ms.crossChatMemory !== false ? ' checked' : '') + '>' +
+              '<span class="aiw-switch-track"></span>' +
+            '</label>' +
+          '</div>' +
+          '<div class="aiw-st-row aiw-st-row-static">' +
+            '<div class="aiw-st-row-col">' +
               '<div class="aiw-st-row-label">使用长期记忆</div>' +
-              '<div class="aiw-st-row-desc">开启后，新对话与跨窗口问答会自动检索相关记忆辅助回答</div>' +
+              '<div class="aiw-st-row-desc">回答时按相关性自动检索并注入匹配记忆</div>' +
             '</div>' +
             '<label class="aiw-switch">' +
               '<input type="checkbox" id="aiw-mem-use-toggle"' + (ms.useMemory ? ' checked' : '') + '>' +
@@ -1656,7 +1726,7 @@
           '<div class="aiw-st-row aiw-st-row-static">' +
             '<div class="aiw-st-row-col">' +
               '<div class="aiw-st-row-label">自动记忆</div>' +
-              '<div class="aiw-st-row-desc">自动保存偏好、习惯、计划与项目背景，绝不保存密码或密钥</div>' +
+              '<div class="aiw-st-row-desc">自动提取偏好、习惯、计划与项目背景，绝不保存密码或密钥</div>' +
             '</div>' +
             '<label class="aiw-switch">' +
               '<input type="checkbox" id="aiw-mem-auto-toggle"' + (ms.autoMemory ? ' checked' : '') + '>' +
@@ -1680,6 +1750,7 @@
         '</div>' +
 
         '<div class="aiw-mem-list" id="aiw-mem-list">' + renderMemoryCardsHtml(filtered) + '</div>' +
+        renderMemoryTasksHtml(_ctx.memoryTasks) +
       '</div>'
     );
   }
@@ -1774,6 +1845,9 @@
         });
         notifyToast('记忆已更新');
       } else {
+        if (typeof S().removeDeletedMemorySignatureByContent === 'function') {
+          await S().removeDeletedMemorySignatureByContent(content);
+        }
         await S().createMemory({
           content: content,
           category: draftCat,
@@ -1820,11 +1894,31 @@
   }
 
   function bindMemoryPageEvents(layer) {
+    var shortToggle = layer.querySelector('#aiw-mem-short-toggle');
+    var crossToggle = layer.querySelector('#aiw-mem-cross-toggle');
     var useToggle = layer.querySelector('#aiw-mem-use-toggle');
     var autoToggle = layer.querySelector('#aiw-mem-auto-toggle');
     var searchInput = layer.querySelector('#aiw-mem-search');
     var addBtn = layer.querySelector('#aiw-mem-add-btn');
     var clearAllBtn = layer.querySelector('#aiw-mem-clear-all');
+    var retryTasksBtn = layer.querySelector('#aiw-mem-retry-tasks');
+    var clearTasksBtn = layer.querySelector('#aiw-mem-clear-tasks');
+
+    if (shortToggle) {
+      shortToggle.addEventListener('change', async function() {
+        _ctx.memorySettings = await S().saveMemorySettings({ shortTermContext: shortToggle.checked });
+        notifyWorkspaceStateChanged();
+        notifyToast(shortToggle.checked ? '已开启短期上下文' : '已关闭短期上下文');
+      });
+    }
+
+    if (crossToggle) {
+      crossToggle.addEventListener('change', async function() {
+        _ctx.memorySettings = await S().saveMemorySettings({ crossChatMemory: crossToggle.checked });
+        notifyWorkspaceStateChanged();
+        notifyToast(crossToggle.checked ? '已开启跨窗口记忆' : '已关闭跨窗口记忆');
+      });
+    }
 
     useToggle.addEventListener('change', async function() {
       _ctx.memorySettings = await S().saveMemorySettings({ useMemory: useToggle.checked });
@@ -1871,6 +1965,40 @@
         }
       );
     });
+
+    if (retryTasksBtn) {
+      retryTasksBtn.addEventListener('click', async function() {
+        if (!M() || typeof M().retryFailedMemoryTasks !== 'function') return;
+        retryTasksBtn.disabled = true;
+        retryTasksBtn.textContent = '重试中...';
+        try {
+          var res = await M().retryFailedMemoryTasks(_ctx.effectiveApi);
+          _ctx.memories = await S().listMemories();
+          _ctx.memoryTasks = await S().listMemoryTasks();
+          notifyWorkspaceStateChanged();
+          renderCurrentView();
+          var savedTotal = (res.addedCount || 0) + (res.updatedCount || 0);
+          if (res.failedTasks && res.failedTasks.length) {
+            notifyToast('仍有 ' + res.failedTasks.length + ' 条任务失败，请检查 API 配置或网络');
+          } else {
+            notifyToast(savedTotal ? ('重试成功，已写入 ' + savedTotal + ' 条记忆') : '失败任务已重试完成');
+          }
+        } catch (err) {
+          notifyToast((err && err.message) || '重试失败');
+          renderCurrentView();
+        }
+      });
+    }
+
+    if (clearTasksBtn) {
+      clearTasksBtn.addEventListener('click', async function() {
+        if (typeof S().clearFinishedMemoryTasks === 'function') {
+          _ctx.memoryTasks = await S().clearFinishedMemoryTasks();
+          renderCurrentView();
+          notifyToast('已清理运行记录');
+        }
+      });
+    }
 
     bindMemoryListItemEvents(layer);
   }

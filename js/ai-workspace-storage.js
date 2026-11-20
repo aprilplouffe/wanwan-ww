@@ -20,10 +20,14 @@
     CHAT_PREFIX: 'aiw_chat:',
     MEMORY_SETTINGS: 'aiw_memory_settings',
     MEMORY_IDS: 'aiw_memory_ids',
-    MEMORY_PREFIX: 'aiw_memory:'
+    MEMORY_PREFIX: 'aiw_memory:',
+    MEMORY_TASKS: 'aiw_memory_tasks',
+    DELETED_MEMORY_SIGS: 'aiw_deleted_memory_sigs'
   };
 
   var DEFAULT_MEMORY_SETTINGS = {
+    shortTermContext: true,
+    crossChatMemory: true,
     useMemory: true,
     autoMemory: true,
     updatedAt: 0
@@ -700,7 +704,12 @@
       updatedAt: Number(src.updatedAt) || now,
       model: String(src.model || '').trim(),
       presetId: String(src.presetId || '').trim(),
-      presetSnapshot: src.presetSnapshot ? buildPresetSnapshot(src.presetSnapshot) : null
+      presetSnapshot: src.presetSnapshot ? buildPresetSnapshot(src.presetSnapshot) : null,
+      projectId: String(src.projectId || '').trim(),
+      summary: String(src.summary || '').trim(),
+      summaryUpToCount: Math.max(0, Number(src.summaryUpToCount) || 0),
+      summaryUpdatedAt: Number(src.summaryUpdatedAt) || 0,
+      lastMemoryMessageId: String(src.lastMemoryMessageId || '').trim()
     };
   }
 
@@ -858,6 +867,8 @@
     var saved = await dbGetConfig(KEYS.MEMORY_SETTINGS);
     var src = saved && typeof saved === 'object' ? saved : {};
     return {
+      shortTermContext: typeof src.shortTermContext === 'boolean' ? src.shortTermContext : DEFAULT_MEMORY_SETTINGS.shortTermContext,
+      crossChatMemory: typeof src.crossChatMemory === 'boolean' ? src.crossChatMemory : DEFAULT_MEMORY_SETTINGS.crossChatMemory,
       useMemory: typeof src.useMemory === 'boolean' ? src.useMemory : DEFAULT_MEMORY_SETTINGS.useMemory,
       autoMemory: typeof src.autoMemory === 'boolean' ? src.autoMemory : DEFAULT_MEMORY_SETTINGS.autoMemory,
       updatedAt: Number(src.updatedAt) || 0
@@ -868,6 +879,8 @@
     var current = await getMemorySettings();
     var p = patch && typeof patch === 'object' ? patch : {};
     var next = {
+      shortTermContext: typeof p.shortTermContext === 'boolean' ? p.shortTermContext : current.shortTermContext,
+      crossChatMemory: typeof p.crossChatMemory === 'boolean' ? p.crossChatMemory : current.crossChatMemory,
       useMemory: typeof p.useMemory === 'boolean' ? p.useMemory : current.useMemory,
       autoMemory: typeof p.autoMemory === 'boolean' ? p.autoMemory : current.autoMemory,
       updatedAt: Date.now()
@@ -940,8 +953,51 @@
     return next;
   }
 
+  function normalizeDeletedSignatureText(text) {
+    return String(text || '')
+      .toLowerCase()
+      .replace(/^[-*•\d.)\s]+/, '')
+      .replace(/[\s，。！？、；：“”"'‘’（）()【】\[\],.!?;:~`「」]+/g, '')
+      .trim();
+  }
+
+  async function listDeletedMemorySignatures() {
+    var list = await dbGetConfig(KEYS.DELETED_MEMORY_SIGS);
+    return Array.isArray(list) ? list : [];
+  }
+
+  async function addDeletedMemorySignature(mem) {
+    if (!mem || !mem.content) return [];
+    var norm = normalizeDeletedSignatureText(mem.content);
+    if (!norm) return await listDeletedMemorySignatures();
+    var list = await listDeletedMemorySignatures();
+    var filtered = list.filter(function(item) { return item && item.norm !== norm; });
+    filtered.unshift({
+      norm: norm,
+      content: String(mem.content || '').slice(0, 120),
+      sourceChatId: String(mem.sourceChatId || ''),
+      deletedAt: Date.now()
+    });
+    if (filtered.length > 100) filtered = filtered.slice(0, 100);
+    return await dbPutConfig(KEYS.DELETED_MEMORY_SIGS, filtered);
+  }
+
+  async function removeDeletedMemorySignatureByContent(content) {
+    var norm = normalizeDeletedSignatureText(content);
+    if (!norm) return;
+    var list = await listDeletedMemorySignatures();
+    var next = list.filter(function(item) { return item && item.norm !== norm; });
+    if (next.length !== list.length) {
+      await dbPutConfig(KEYS.DELETED_MEMORY_SIGS, next);
+    }
+  }
+
   async function deleteMemory(id) {
     if (!id) return false;
+    var existing = await getMemory(id);
+    if (existing) {
+      await addDeletedMemorySignature(existing);
+    }
     var ids = await dbGetConfig(KEYS.MEMORY_IDS);
     if (!Array.isArray(ids)) ids = [];
     var idx = ids.indexOf(id);
@@ -954,6 +1010,10 @@
   }
 
   async function clearAllMemories() {
+    var existingList = await listMemories();
+    for (var k = 0; k < existingList.length; k++) {
+      await addDeletedMemorySignature(existingList[k]);
+    }
     var ids = await dbGetConfig(KEYS.MEMORY_IDS);
     if (!Array.isArray(ids)) ids = [];
     for (var i = 0; i < ids.length; i++) {
@@ -961,6 +1021,76 @@
     }
     await dbPutConfig(KEYS.MEMORY_IDS, []);
     return true;
+  }
+
+  // ===== 11. 持久化记忆与摘要任务队列（防止切换聊天/刷新丢失，支持失败记录与重试） =====
+  function generateTaskId() {
+    return 'memtask_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7);
+  }
+
+  async function listMemoryTasks() {
+    var tasks = await dbGetConfig(KEYS.MEMORY_TASKS);
+    return Array.isArray(tasks) ? tasks : [];
+  }
+
+  async function saveMemoryTasks(tasks) {
+    var arr = Array.isArray(tasks) ? tasks.slice(0, 40) : [];
+    return await dbPutConfig(KEYS.MEMORY_TASKS, arr);
+  }
+
+  async function enqueueMemoryTask(taskData) {
+    var src = taskData && typeof taskData === 'object' ? taskData : {};
+    var tasks = await listMemoryTasks();
+    var turnKey = String(src.turnKey || '').trim();
+    if (turnKey) {
+      var dup = tasks.find(function(t) {
+        return t && t.turnKey === turnKey && (t.status === 'pending' || t.status === 'running' || t.status === 'done');
+      });
+      if (dup) return dup;
+    }
+    var now = Date.now();
+    var task = {
+      id: src.id || generateTaskId(),
+      type: String(src.type || 'extract_memory'),
+      turnKey: turnKey,
+      chatId: String(src.chatId || ''),
+      chatTitle: String(src.chatTitle || ''),
+      projectId: String(src.projectId || ''),
+      userId: String(src.userId || 'local_user'),
+      payload: src.payload || {},
+      status: 'pending',
+      attempts: 0,
+      maxAttempts: Math.max(1, Number(src.maxAttempts) || 3),
+      lastError: '',
+      resultSummary: '',
+      createdAt: now,
+      updatedAt: now,
+      nextRetryAt: 0
+    };
+    tasks.unshift(task);
+    await saveMemoryTasks(tasks);
+    return task;
+  }
+
+  async function updateMemoryTask(taskId, patch) {
+    if (!taskId) return null;
+    var tasks = await listMemoryTasks();
+    var idx = tasks.findIndex(function(t) { return t && t.id === taskId; });
+    if (idx === -1) return null;
+    var next = Object.assign({}, tasks[idx], patch || {}, {
+      id: tasks[idx].id,
+      updatedAt: Date.now()
+    });
+    tasks[idx] = next;
+    await saveMemoryTasks(tasks);
+    return next;
+  }
+
+  async function clearFinishedMemoryTasks() {
+    var tasks = await listMemoryTasks();
+    var active = tasks.filter(function(t) { return t && (t.status === 'pending' || t.status === 'running'); });
+    await saveMemoryTasks(active);
+    return active;
   }
 
   global.AiWorkspaceStorage = {
@@ -1012,6 +1142,14 @@
     createMemory: createMemory,
     updateMemory: updateMemory,
     deleteMemory: deleteMemory,
-    clearAllMemories: clearAllMemories
+    clearAllMemories: clearAllMemories,
+    listDeletedMemorySignatures: listDeletedMemorySignatures,
+    addDeletedMemorySignature: addDeletedMemorySignature,
+    removeDeletedMemorySignatureByContent: removeDeletedMemorySignatureByContent,
+    listMemoryTasks: listMemoryTasks,
+    saveMemoryTasks: saveMemoryTasks,
+    enqueueMemoryTask: enqueueMemoryTask,
+    updateMemoryTask: updateMemoryTask,
+    clearFinishedMemoryTasks: clearFinishedMemoryTasks
   };
 })(typeof window !== 'undefined' ? window : globalThis);

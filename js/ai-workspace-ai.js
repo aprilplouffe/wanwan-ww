@@ -310,12 +310,14 @@
     };
   }
 
-  // ===== 提示词组装引擎（严格顺序：基础规则 -> 用户个性化 -> 预设角色 -> 相关长期记忆 -> 历史消息 -> 当前用户输入） =====
+  // ===== 提示词组装引擎（严格顺序：基础规则 -> 用户个性化 -> 预设角色 -> 短期摘要 -> 相关长期记忆 -> 跨窗口历史参考 -> 历史消息 -> 当前用户输入） =====
   function composeSystemPrompt(options) {
     var opts = options && typeof options === 'object' ? options : {};
     var personalization = opts.personalization;
     var preset = opts.preset;
+    var shortTermSummary = String(opts.shortTermSummary || '').trim();
     var memories = Array.isArray(opts.memories) ? opts.memories : [];
+    var crossChatContexts = Array.isArray(opts.crossChatContexts) ? opts.crossChatContexts : [];
     var deepThink = !!opts.deepThink;
 
     var sections = [];
@@ -359,7 +361,16 @@
       }
     }
 
-    // 4. 按相关性筛选后的长期记忆（仅作参考辅助，不得覆盖系统规则或用户当前指令）
+    // 4. 当前对话短期记忆摘要（覆盖更早历史轮次，避免重复叠加）
+    if (shortTermSummary) {
+      sections.push(
+        '【当前对话短期摘要（较早轮次阶段性总结）】\n' +
+        '以下为本对话此前轮次的核心上下文摘要，后续消息列表仅保留最近原始对话：\n' +
+        shortTermSummary
+      );
+    }
+
+    // 5. 按相关性筛选后的长期记忆（仅作参考辅助，不得覆盖系统规则或用户当前指令）
     if (memories.length > 0) {
       var memLines = memories.map(function(m) {
         var cat = m.category ? '[' + String(m.category) + '] ' : '';
@@ -374,7 +385,22 @@
       }
     }
 
-    // 5. 若用户开启了深入思考 UI 开关，补充深度拆解提示
+    // 6. 跨窗口历史对话摘要/片段参考（仅在开启跨窗口记忆且命中相关内容时注入）
+    if (crossChatContexts.length > 0) {
+      var crossLines = crossChatContexts.map(function(c) {
+        var label = c.chatTitle ? ('「' + String(c.chatTitle) + '」') : '「历史对话」';
+        return '- 来自' + label + '：' + String(c.content || '').trim();
+      }).filter(Boolean);
+      if (crossLines.length > 0) {
+        sections.push(
+          '【跨窗口相关历史参考（仅作辅助，不可覆盖系统规则或用户当前明确指令）】\n' +
+          '以下是用户在其他聊天窗口中曾提到过的相关上下文，请结合当前问题自然参考：\n' +
+          crossLines.join('\n')
+        );
+      }
+    }
+
+    // 7. 若用户开启了深入思考 UI 开关，补充深度拆解提示
     if (deepThink) {
       sections.push(
         '【思考模式要求】\n' +
@@ -387,15 +413,28 @@
 
   function composeMessages(options) {
     var opts = options && typeof options === 'object' ? options : {};
+    var history = Array.isArray(opts.historyMessages) ? opts.historyMessages : [];
+    var shortTermSummary = String(opts.shortTermSummary || '').trim();
+    var summaryUpToCount = Math.max(0, Number(opts.summaryUpToCount) || 0);
+    var maxRecent = Math.max(4, Number(opts.maxRecentMessages) || 14);
+
+    // 若存在短期摘要且明确标注覆盖前 summaryUpToCount 条，则只取未摘要的最近原始消息，绝不重复叠加
+    var recentSlice = history;
+    if (shortTermSummary && summaryUpToCount > 0 && summaryUpToCount < history.length) {
+      recentSlice = history.slice(summaryUpToCount);
+    }
+    if (recentSlice.length > maxRecent) {
+      recentSlice = recentSlice.slice(recentSlice.length - maxRecent);
+    }
+
     var systemText = composeSystemPrompt(opts);
     var out = [];
     if (systemText) {
       out.push({ role: 'system', content: systemText });
     }
 
-    var history = Array.isArray(opts.historyMessages) ? opts.historyMessages : [];
-    for (var i = 0; i < history.length; i++) {
-      var msg = history[i];
+    for (var i = 0; i < recentSlice.length; i++) {
+      var msg = recentSlice[i];
       if (!msg || (msg.role !== 'user' && msg.role !== 'assistant')) continue;
       var text = String(msg.content || '').trim();
       if (!text) continue;
@@ -610,10 +649,12 @@
     };
   }
 
-  // ===== 轻量单次非流式请求（供后台自动记忆提取等复用当前知屿有效 API 配置） =====
+  // ===== 轻量单次非流式请求（供后台自动记忆提取、短期摘要与跨窗口辅助检索复用当前知屿有效 API 配置） =====
   async function requestChatCompletion(options) {
     var opts = options && typeof options === 'object' ? options : {};
-    var cfg = opts.apiConfig || (await resolveEffectiveApiConfig());
+    var cfg = (opts.apiConfig && (opts.apiConfig.url || opts.apiConfig.baseUrl) && (opts.apiConfig.key || opts.apiConfig.apiKey))
+      ? opts.apiConfig
+      : (await resolveEffectiveApiConfig());
     var url = normalizeBaseUrl(cfg.url || cfg.baseUrl);
     var key = String(cfg.key || cfg.apiKey || '').trim();
     var model = String(opts.model || cfg.model || '').trim();
@@ -630,6 +671,9 @@
       temperature: temperature,
       stream: false
     };
+    if (opts.maxTokens && Number(opts.maxTokens) > 0) {
+      body.max_tokens = Math.round(Number(opts.maxTokens));
+    }
 
     var endpoint = buildChatCompletionsUrl(url);
     var res = await fetch(endpoint, {
@@ -642,19 +686,51 @@
       signal: opts.signal
     });
     var rawText = await res.text();
+    var contentType = (res.headers && res.headers.get && res.headers.get('content-type')) || '';
+
+    if (!res.ok) {
+      var errJson = null;
+      try { errJson = rawText ? JSON.parse(rawText) : {}; } catch (_) {}
+      var detail = (errJson && ((errJson.error && errJson.error.message) || errJson.message || errJson.error)) || rawText || ('HTTP ' + res.status);
+      var err = new Error('HTTP ' + res.status + '：' + String(detail).slice(0, 200));
+      err.status = res.status;
+      throw err;
+    }
+
+    // 部分反代/网关即使 stream=false 仍可能返回 SSE 文本流，兼容解析
+    if (/text\/event-stream/i.test(contentType) || /^\s*data:\s*/m.test(rawText)) {
+      var sseLines = rawText.split(/\r?\n/);
+      var sseText = '';
+      for (var i = 0; i < sseLines.length; i++) {
+        var line = sseLines[i].trim();
+        if (!line || line.indexOf('data:') !== 0) continue;
+        var payload = line.slice(5).trim();
+        if (!payload || payload === '[DONE]') continue;
+        try {
+          var chunk = JSON.parse(payload);
+          var delta = extractDeltaText(chunk);
+          if (delta) sseText += delta;
+        } catch (_) {}
+      }
+      if (sseText.trim()) {
+        return {
+          content: sseText.trim(),
+          model: model,
+          source: cfg.source || 'unknown'
+        };
+      }
+    }
+
     var json = null;
     try {
       json = rawText ? JSON.parse(rawText) : {};
     } catch (_) {
       json = null;
     }
-    if (!res.ok) {
-      var detail = (json && ((json.error && json.error.message) || json.message || json.error)) || rawText || ('HTTP ' + res.status);
-      var err = new Error('HTTP ' + res.status + '：' + String(detail).slice(0, 200));
-      err.status = res.status;
-      throw err;
-    }
     if (!json) throw new Error('API 返回了无法解析的 JSON 响应');
+    if (json.error) {
+      throw new Error((json.error && json.error.message) || String(json.error));
+    }
     return {
       content: extractNonStreamText(json).trim(),
       model: (json && json.model) || model,
