@@ -43,7 +43,10 @@
     general: null,
     presets: [],
     customApi: null,
-    effectiveApi: null
+    effectiveApi: null,
+    memorySettings: { useMemory: true, autoMemory: true },
+    memories: [],
+    memorySearchQuery: ''
   };
 
   function S() {
@@ -52,6 +55,10 @@
 
   function AI() {
     return global.AiWorkspaceAI;
+  }
+
+  function M() {
+    return global.AiWorkspaceMemory;
   }
 
   function escapeHtml(str) {
@@ -147,7 +154,9 @@
       store.getAppearance(),
       store.getGeneralSettings(),
       store.listPresets(),
-      store.getCustomApiConfig()
+      store.getCustomApiConfig(),
+      typeof store.getMemorySettings === 'function' ? store.getMemorySettings() : Promise.resolve({ useMemory: true, autoMemory: true }),
+      typeof store.listMemories === 'function' ? store.listMemories() : Promise.resolve([])
     ]);
     _ctx.profile = results[0];
     _ctx.personalization = results[1];
@@ -155,6 +164,8 @@
     _ctx.general = results[3];
     _ctx.presets = results[4];
     _ctx.customApi = results[5];
+    _ctx.memorySettings = results[6] || { useMemory: true, autoMemory: true };
+    _ctx.memories = results[7] || [];
     if (AI() && typeof AI().resolveEffectiveApiConfig === 'function') {
       _ctx.effectiveApi = await AI().resolveEffectiveApiConfig();
     }
@@ -169,7 +180,9 @@
         general: _ctx.general,
         presets: _ctx.presets,
         customApi: _ctx.customApi,
-        effectiveApi: _ctx.effectiveApi
+        effectiveApi: _ctx.effectiveApi,
+        memorySettings: _ctx.memorySettings,
+        memories: _ctx.memories
       });
     }
   }
@@ -254,6 +267,9 @@
     var apiStatusVal = customApi.complete
       ? ('专属 · ' + (customApi.model || '已配置'))
       : '使用主 API';
+    var memSettings = _ctx.memorySettings || { useMemory: true, autoMemory: true };
+    var memCount = (_ctx.memories || []).length;
+    var memorySummary = memSettings.useMemory ? (memCount + ' 条') : '已关闭';
 
     return (
       '<div class="aiw-st-topbar">' +
@@ -298,10 +314,10 @@
             '<span class="aiw-st-row-val">' + escapeHtml(presetSummary) + '</span>' +
             '<span class="aiw-st-row-arrow"><i class="fa-solid fa-angle-right"></i></span>' +
           '</button>' +
-          '<button type="button" class="aiw-st-row" data-st-action="memory-entry">' +
+          '<button type="button" class="aiw-st-row" data-st-nav="memory">' +
             '<span class="aiw-st-row-icon"><i class="fa-regular fa-bookmark"></i></span>' +
             '<span class="aiw-st-row-label">记忆</span>' +
-            '<span class="aiw-st-row-tag">待接入</span>' +
+            '<span class="aiw-st-row-val">' + escapeHtml(memorySummary) + '</span>' +
             '<span class="aiw-st-row-arrow"><i class="fa-solid fa-angle-right"></i></span>' +
           '</button>' +
           '<button type="button" class="aiw-st-row" data-st-action="plugins-entry">' +
@@ -1521,6 +1537,7 @@
     saveBtn.addEventListener('click', doSaveCustomApi);
     saveTopBtn.addEventListener('click', doSaveCustomApi);
 
+    var okBtn = null;
     clearBtn.addEventListener('click', function() {
       showConfirmModal(
         '清空专属 API 配置',
@@ -1539,6 +1556,323 @@
         }
       );
     });
+    void okBtn;
+  }
+
+  // ===== 视图 7：长期记忆管理（第五阶段） =====
+  function formatMemoryDate(ts) {
+    if (!ts) return '';
+    var d = new Date(ts);
+    if (isNaN(d.getTime())) return '';
+    var pad = function(n) { return n < 10 ? '0' + n : String(n); };
+    return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) + ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes());
+  }
+
+  function formatScopeLabel(scope) {
+    if (scope === 'chat') return '仅当前对话';
+    if (scope === 'project') return '项目记忆';
+    return '跨窗口共享';
+  }
+
+  function getFilteredMemories() {
+    var list = Array.isArray(_ctx.memories) ? _ctx.memories : [];
+    var q = String(_ctx.memorySearchQuery || '').trim().toLowerCase();
+    if (!q) return list;
+    return list.filter(function(m) {
+      return String(m.content || '').toLowerCase().indexOf(q) !== -1 ||
+        String(m.category || '').toLowerCase().indexOf(q) !== -1 ||
+        String(m.sourceChatTitle || '').toLowerCase().indexOf(q) !== -1;
+    });
+  }
+
+  function renderMemoryCardsHtml(list) {
+    if (!list.length) {
+      var hasQuery = !!String(_ctx.memorySearchQuery || '').trim();
+      return (
+        '<div class="aiw-mem-empty">' +
+          '<div class="aiw-mem-empty-icon"><i class="fa-regular fa-bookmark"></i></div>' +
+          '<div class="aiw-mem-empty-title">' + (hasQuery ? '没有匹配的长期记忆' : '还没有保存任何长期记忆') + '</div>' +
+          '<div class="aiw-mem-empty-sub">' +
+            (hasQuery
+              ? '换个关键词试试，或清空搜索查看全部记忆。'
+              : '当开启「自动记忆」后，知屿会在对话中自动记住你的偏好、习惯、长期计划与重要决定，也可以点击右上角手动新增。') +
+          '</div>' +
+        '</div>'
+      );
+    }
+
+    return list.map(function(m) {
+      var sourceLabel = m.sourceChatTitle ? ('来源：' + m.sourceChatTitle) : '手动添加';
+      var timeLabel = formatMemoryDate(m.updatedAt || m.createdAt);
+      return (
+        '<div class="aiw-mem-card" data-mem-id="' + escapeHtml(m.id) + '">' +
+          '<div class="aiw-mem-card-top">' +
+            '<div class="aiw-mem-badges">' +
+              '<span class="aiw-mem-badge is-cat">' + escapeHtml(m.category || '备忘') + '</span>' +
+              '<span class="aiw-mem-badge is-scope">' + escapeHtml(formatScopeLabel(m.scope)) + '</span>' +
+              '<span class="aiw-mem-badge is-imp">重要度 ' + escapeHtml(String(m.importance || 3)) + '/5</span>' +
+            '</div>' +
+          '</div>' +
+          '<div class="aiw-mem-content">' + escapeHtml(m.content) + '</div>' +
+          '<div class="aiw-mem-meta">' +
+            '<span class="aiw-mem-source">' + escapeHtml(sourceLabel) + '</span>' +
+            (timeLabel ? '<span class="aiw-mem-time">' + escapeHtml(timeLabel) + '</span>' : '') +
+          '</div>' +
+          '<div class="aiw-mem-actions">' +
+            '<button type="button" class="aiw-preset-act" data-mem-act="edit" data-mem-id="' + escapeHtml(m.id) + '"><i class="fa-regular fa-pen-to-square"></i> 编辑</button>' +
+            '<button type="button" class="aiw-preset-act is-danger" data-mem-act="delete" data-mem-id="' + escapeHtml(m.id) + '"><i class="fa-regular fa-trash-can"></i> 删除</button>' +
+          '</div>' +
+        '</div>'
+      );
+    }).join('');
+  }
+
+  function renderMemoryPageHtml() {
+    var ms = _ctx.memorySettings || { useMemory: true, autoMemory: true };
+    var allList = _ctx.memories || [];
+    var filtered = getFilteredMemories();
+
+    return (
+      '<div class="aiw-st-topbar">' +
+        '<button type="button" class="aiw-circle-btn" id="aiw-st-sub-back" aria-label="返回设置">' +
+          '<i class="fa-solid fa-arrow-left"></i>' +
+        '</button>' +
+        '<div class="aiw-st-topbar-title">记忆</div>' +
+        '<button type="button" class="aiw-st-top-action" id="aiw-mem-add-btn"><i class="fa-solid fa-plus"></i> 新增</button>' +
+      '</div>' +
+
+      '<div class="aiw-st-scroll">' +
+        '<div class="aiw-st-card">' +
+          '<div class="aiw-st-row aiw-st-row-static">' +
+            '<div class="aiw-st-row-col">' +
+              '<div class="aiw-st-row-label">使用长期记忆</div>' +
+              '<div class="aiw-st-row-desc">开启后，新对话与跨窗口问答会自动检索相关记忆辅助回答</div>' +
+            '</div>' +
+            '<label class="aiw-switch">' +
+              '<input type="checkbox" id="aiw-mem-use-toggle"' + (ms.useMemory ? ' checked' : '') + '>' +
+              '<span class="aiw-switch-track"></span>' +
+            '</label>' +
+          '</div>' +
+          '<div class="aiw-st-row aiw-st-row-static">' +
+            '<div class="aiw-st-row-col">' +
+              '<div class="aiw-st-row-label">自动记忆</div>' +
+              '<div class="aiw-st-row-desc">自动保存偏好、习惯、计划与项目背景，绝不保存密码或密钥</div>' +
+            '</div>' +
+            '<label class="aiw-switch">' +
+              '<input type="checkbox" id="aiw-mem-auto-toggle"' + (ms.autoMemory ? ' checked' : '') + '>' +
+              '<span class="aiw-switch-track"></span>' +
+            '</label>' +
+          '</div>' +
+        '</div>' +
+
+        '<div class="aiw-mem-toolbar">' +
+          '<div class="aiw-mem-search-wrap">' +
+            '<i class="fa-solid fa-magnifying-glass"></i>' +
+            '<input type="search" class="aiw-mem-search-input" id="aiw-mem-search" value="' + escapeHtml(_ctx.memorySearchQuery || '') + '" placeholder="搜索记忆内容、分类或来源对话">' +
+          '</div>' +
+        '</div>' +
+
+        '<div class="aiw-mem-count-bar">' +
+          '<span class="aiw-pr-count" id="aiw-mem-count-text">共 ' + allList.length + ' 条长期记忆' + (_ctx.memorySearchQuery ? ('（筛选出 ' + filtered.length + ' 条）') : '') + '</span>' +
+          '<button type="button" class="aiw-st-btn-secondary aiw-st-btn-sm aiw-btn-text-danger" id="aiw-mem-clear-all"' + (allList.length ? '' : ' disabled') + '>' +
+            '<i class="fa-regular fa-trash-can"></i> 清空全部' +
+          '</button>' +
+        '</div>' +
+
+        '<div class="aiw-mem-list" id="aiw-mem-list">' + renderMemoryCardsHtml(filtered) + '</div>' +
+      '</div>'
+    );
+  }
+
+  function openMemoryEditorModal(layer, existingMem) {
+    var isEdit = !!(existingMem && existingMem.id);
+    var categories = (S() && S().MEMORY_CATEGORIES) || ['偏好', '习惯', '长期计划', '项目', '决定', '备忘', '身份信息'];
+    var draftCat = (existingMem && existingMem.category) || '偏好';
+    var draftScope = (existingMem && existingMem.scope) || 'user';
+    var draftImp = (existingMem && existingMem.importance) || 3;
+
+    var catChips = categories.map(function(cat) {
+      return '<button type="button" class="aiw-chip-btn' + (cat === draftCat ? ' active' : '') + '" data-mem-cat="' + escapeHtml(cat) + '">' + escapeHtml(cat) + '</button>';
+    }).join('');
+
+    var scopeChoices = [
+      { id: 'user', label: '跨窗口共享' },
+      { id: 'chat', label: '仅当前对话' }
+    ];
+    if (draftScope === 'project') {
+      scopeChoices.push({ id: 'project', label: '项目记忆' });
+    }
+    var scopeSegs = scopeChoices.map(function(sc) {
+      return '<button type="button" class="aiw-seg-btn' + (sc.id === draftScope ? ' active' : '') + '" data-mem-scope="' + sc.id + '">' + sc.label + '</button>';
+    }).join('');
+
+    var impBtns = [1, 2, 3, 4, 5].map(function(num) {
+      return '<button type="button" class="aiw-seg-btn' + (num === draftImp ? ' active' : '') + '" data-mem-imp="' + num + '">' + num + '</button>';
+    }).join('');
+
+    var bodyHtml =
+      '<label class="aiw-field-label" for="aiw-mem-ed-content">记忆内容 *</label>' +
+      '<textarea class="aiw-field-textarea" id="aiw-mem-ed-content" rows="4" maxlength="260" placeholder="例如：用户不喜欢香菜，点外卖或推荐食谱时请避开">' + escapeHtml(existingMem ? existingMem.content : '') + '</textarea>' +
+      '<label class="aiw-field-label" style="margin-top:12px;">记忆分类</label>' +
+      '<div class="aiw-chip-grid">' + catChips + '</div>' +
+      '<label class="aiw-field-label" style="margin-top:12px;">适用范围</label>' +
+      '<div class="aiw-seg-control">' + scopeSegs + '</div>' +
+      '<label class="aiw-field-label" style="margin-top:12px;">重要程度（1-5）</label>' +
+      '<div class="aiw-seg-control">' + impBtns + '</div>';
+
+    var footerHtml =
+      '<button type="button" class="aiw-st-btn-secondary" id="aiw-mem-ed-cancel">取消</button>' +
+      '<button type="button" class="aiw-st-btn-primary" id="aiw-mem-ed-save">' + (isEdit ? '保存修改' : '添加记忆') + '</button>';
+
+    var modal = showCustomModal(isEdit ? '编辑长期记忆' : '新增长期记忆', bodyHtml, footerHtml);
+    if (!modal) return;
+
+    modal.querySelectorAll('[data-mem-cat]').forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        draftCat = btn.getAttribute('data-mem-cat');
+        modal.querySelectorAll('[data-mem-cat]').forEach(function(b) {
+          b.classList.toggle('active', b === btn);
+        });
+      });
+    });
+
+    modal.querySelectorAll('[data-mem-scope]').forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        draftScope = btn.getAttribute('data-mem-scope');
+        modal.querySelectorAll('[data-mem-scope]').forEach(function(b) {
+          b.classList.toggle('active', b === btn);
+        });
+      });
+    });
+
+    modal.querySelectorAll('[data-mem-imp]').forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        draftImp = Number(btn.getAttribute('data-mem-imp')) || 3;
+        modal.querySelectorAll('[data-mem-imp]').forEach(function(b) {
+          b.classList.toggle('active', b === btn);
+        });
+      });
+    });
+
+    modal.querySelector('#aiw-mem-ed-cancel').addEventListener('click', closeModalOverlay);
+    modal.querySelector('#aiw-mem-ed-save').addEventListener('click', async function() {
+      var content = modal.querySelector('#aiw-mem-ed-content').value.trim();
+      if (!content) {
+        notifyToast('请输入记忆内容');
+        return;
+      }
+      if (M() && typeof M().containsSensitiveSecret === 'function' && M().containsSensitiveSecret(content)) {
+        notifyToast('为了安全，长期记忆不支持保存密码、API Key 或验证码等敏感信息');
+        return;
+      }
+      if (isEdit) {
+        await S().updateMemory(existingMem.id, {
+          content: content,
+          category: draftCat,
+          scope: draftScope,
+          importance: draftImp
+        });
+        notifyToast('记忆已更新');
+      } else {
+        await S().createMemory({
+          content: content,
+          category: draftCat,
+          scope: draftScope,
+          importance: draftImp,
+          sourceChatTitle: '手动添加'
+        });
+        notifyToast('已添加长期记忆');
+      }
+      _ctx.memories = await S().listMemories();
+      closeModalOverlay();
+      notifyWorkspaceStateChanged();
+      renderCurrentView();
+    });
+  }
+
+  function bindMemoryListItemEvents(layer) {
+    layer.querySelectorAll('[data-mem-act]').forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        var act = btn.getAttribute('data-mem-act');
+        var id = btn.getAttribute('data-mem-id');
+        var mem = (_ctx.memories || []).find(function(m) { return m.id === id; });
+        if (!mem) return;
+
+        if (act === 'edit') {
+          openMemoryEditorModal(layer, mem);
+        } else if (act === 'delete') {
+          showConfirmModal(
+            '删除长期记忆',
+            '确定要删除这条记忆吗？删除后将立即停止在对话中检索使用。',
+            '确认删除',
+            true,
+            async function() {
+              await S().deleteMemory(id);
+              _ctx.memories = await S().listMemories();
+              notifyWorkspaceStateChanged();
+              renderCurrentView();
+              notifyToast('记忆已删除');
+            }
+          );
+        }
+      });
+    });
+  }
+
+  function bindMemoryPageEvents(layer) {
+    var useToggle = layer.querySelector('#aiw-mem-use-toggle');
+    var autoToggle = layer.querySelector('#aiw-mem-auto-toggle');
+    var searchInput = layer.querySelector('#aiw-mem-search');
+    var addBtn = layer.querySelector('#aiw-mem-add-btn');
+    var clearAllBtn = layer.querySelector('#aiw-mem-clear-all');
+
+    useToggle.addEventListener('change', async function() {
+      _ctx.memorySettings = await S().saveMemorySettings({ useMemory: useToggle.checked });
+      notifyWorkspaceStateChanged();
+      notifyToast(useToggle.checked ? '已开启长期记忆检索' : '已关闭长期记忆检索');
+    });
+
+    autoToggle.addEventListener('change', async function() {
+      _ctx.memorySettings = await S().saveMemorySettings({ autoMemory: autoToggle.checked });
+      notifyWorkspaceStateChanged();
+      notifyToast(autoToggle.checked ? '已开启自动记忆提取' : '已关闭自动记忆提取');
+    });
+
+    searchInput.addEventListener('input', function() {
+      _ctx.memorySearchQuery = searchInput.value || '';
+      var filtered = getFilteredMemories();
+      var listEl = layer.querySelector('#aiw-mem-list');
+      var countEl = layer.querySelector('#aiw-mem-count-text');
+      if (listEl) listEl.innerHTML = renderMemoryCardsHtml(filtered);
+      if (countEl) {
+        countEl.textContent = '共 ' + (_ctx.memories || []).length + ' 条长期记忆' + (_ctx.memorySearchQuery ? ('（筛选出 ' + filtered.length + ' 条）') : '');
+      }
+      bindMemoryListItemEvents(layer);
+    });
+
+    addBtn.addEventListener('click', function() {
+      openMemoryEditorModal(layer, null);
+    });
+
+    clearAllBtn.addEventListener('click', function() {
+      if (!(_ctx.memories || []).length) return;
+      showConfirmModal(
+        '清空全部长期记忆',
+        '确定要清空知屿保存的全部 ' + _ctx.memories.length + ' 条长期记忆吗？此操作不可恢复。',
+        '确认清空',
+        true,
+        async function() {
+          await S().clearAllMemories();
+          _ctx.memories = [];
+          _ctx.memorySearchQuery = '';
+          notifyWorkspaceStateChanged();
+          renderCurrentView();
+          notifyToast('已清空全部长期记忆');
+        }
+      );
+    });
+
+    bindMemoryListItemEvents(layer);
   }
 
   // ===== 导航栈管理 =====
@@ -1576,6 +1910,9 @@
     } else if (view === 'preset-editor') {
       layer.innerHTML = renderPresetEditorHtml();
       bindPresetEditorEvents(layer);
+    } else if (view === 'memory') {
+      layer.innerHTML = renderMemoryPageHtml();
+      bindMemoryPageEvents(layer);
     } else if (view === 'general') {
       layer.innerHTML = renderGeneralHtml();
       bindGeneralEvents(layer);
@@ -1610,13 +1947,7 @@
     layer.querySelectorAll('[data-st-action]').forEach(function(btn) {
       btn.addEventListener('click', function() {
         var act = btn.getAttribute('data-st-action');
-        if (act === 'memory-entry') {
-          showCustomModal(
-            '记忆',
-            '<p class="aiw-st-modal-msg">「记忆」入口已预留，长期记忆存储与检索将在后续阶段正式接入。</p>',
-            '<button type="button" class="aiw-st-btn-primary" id="aiw-placeholder-ok">我知道了</button>'
-          );
-        } else if (act === 'plugins-entry') {
+        if (act === 'plugins-entry') {
           showCustomModal(
             '插件',
             '<p class="aiw-st-modal-msg">「插件」入口已预留，插件调用与扩展能力将在后续阶段正式接入。</p>',

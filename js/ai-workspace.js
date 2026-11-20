@@ -69,6 +69,10 @@
     return global.AiWorkspaceAI;
   }
 
+  function M() {
+    return global.AiWorkspaceMemory;
+  }
+
   function escapeHtml(str) {
     return String(str == null ? '' : str).replace(/[&<>"']/g, function(ch) {
       return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[ch];
@@ -428,6 +432,16 @@
     } catch (_) {}
   }
 
+  async function syncSidebarMemoryBadge(page) {
+    if (!page || !S() || typeof S().listMemories !== 'function') return;
+    var badgeEl = page.querySelector('#aiw-nav-memory-count');
+    if (!badgeEl) return;
+    try {
+      var list = await S().listMemories();
+      badgeEl.textContent = list.length ? (list.length + ' 条') : '';
+    } catch (_) {}
+  }
+
   function syncSidebarAccountDom(page) {
     if (!page) return;
     var avatarEl = page.querySelector('#aiw-account-avatar');
@@ -436,6 +450,7 @@
     if (avatarEl) avatarEl.src = _state.userProfile.avatar || 'img/ava-00.jpg';
     if (nameEl) nameEl.textContent = _state.userProfile.name || '我';
     if (subEl) subEl.textContent = (_state.userProfile.bio || '本地工作空间') + ' · 设置中心';
+    syncSidebarMemoryBadge(page);
   }
 
   function buildPageHtml() {
@@ -562,7 +577,7 @@
               '<button type="button" class="aiw-nav-item" data-nav="memory">' +
                 '<span class="aiw-nav-item-icon"><i class="fa-regular fa-bookmark"></i></span>' +
                 '<span class="aiw-nav-item-label">记忆空间</span>' +
-                '<span class="aiw-nav-item-tag">待接入</span>' +
+                '<span class="aiw-nav-item-tag" id="aiw-nav-memory-count"></span>' +
               '</button>' +
             '</div>' +
           '</div>' +
@@ -1361,15 +1376,32 @@
     return _state.activeChat;
   }
 
-  async function executeStreamingTurn(page, historyBeforeTurn, userText, assistantMsg, effectiveApi) {
+  async function executeStreamingTurn(page, historyBeforeTurn, userText, assistantMsg, effectiveApi, turnOpts) {
     var preset = resolveEffectivePresetForState();
     var personalization = _state.personalization || (S() ? await S().getPersonalization() : null);
+
+    var relevantMemories = [];
+    if (M() && typeof M().retrieveRelevantMemories === 'function') {
+      try {
+        relevantMemories = await M().retrieveRelevantMemories({
+          query: userText,
+          historyMessages: historyBeforeTurn,
+          chatId: _state.activeChat ? _state.activeChat.id : '',
+          projectId: (_state.activeChat && _state.activeChat.projectId) || '',
+          userId: 'local_user'
+        });
+      } catch (memErr) {
+        console.warn('[AiWorkspace] memory retrieval skipped:', memErr);
+        relevantMemories = [];
+      }
+    }
 
     var composed = AI().composeMessages({
       historyMessages: historyBeforeTurn,
       userContent: userText,
       personalization: personalization,
       preset: preset,
+      memories: relevantMemories,
       deepThink: _state.deepThinkEnabled
     });
 
@@ -1378,6 +1410,7 @@
     _state.abortController = controller;
     syncComposerButtons(page);
 
+    var completedNormally = false;
     try {
       var res = await AI().streamChatCompletion({
         apiConfig: effectiveApi,
@@ -1396,6 +1429,8 @@
       assistantMsg.model = res.model || effectiveApi.model;
       if (!assistantMsg.content.trim()) {
         assistantMsg.error = '模型未返回任何文本内容，请检查模型名称或稍后重试。';
+      } else {
+        completedNormally = true;
       }
     } catch (err) {
       assistantMsg.streaming = false;
@@ -1413,6 +1448,31 @@
       syncComposerButtons(page);
       updateMainStage(page);
       await persistCurrentChatMessages();
+    }
+
+    if (
+      completedNormally &&
+      !(turnOpts && turnOpts.skipAutoMemory) &&
+      M() &&
+      typeof M().extractAndSaveFromTurn === 'function'
+    ) {
+      M().extractAndSaveFromTurn({
+        userText: userText,
+        assistantText: assistantMsg.content,
+        chatId: _state.activeChat ? _state.activeChat.id : '',
+        chatTitle: _state.activeChat ? _state.activeChat.title : '',
+        projectId: (_state.activeChat && _state.activeChat.projectId) || '',
+        apiConfig: effectiveApi,
+        userId: 'local_user'
+      }).then(function(memRes) {
+        if (!memRes) return;
+        var addedCount = memRes.added ? memRes.added.length : 0;
+        var updatedCount = memRes.updated ? memRes.updated.length : 0;
+        if (addedCount > 0 || updatedCount > 0) {
+          syncSidebarMemoryBadge(document.getElementById(PAGE_ID));
+          notifyToast('已自动记住 ' + (addedCount + updatedCount) + ' 条长期记忆');
+        }
+      }).catch(function() {});
     }
   }
 
@@ -1529,7 +1589,7 @@
     _state.messages.push(assistantMsg);
     updateMainStage(page);
 
-    await executeStreamingTurn(page, historyBeforeTurn, userPrompt, assistantMsg, effective);
+    await executeStreamingTurn(page, historyBeforeTurn, userPrompt, assistantMsg, effective, { skipAutoMemory: true });
   }
 
   async function startNewChat(page, silent) {
@@ -1606,6 +1666,11 @@
     page.querySelectorAll('.aiw-nav-item[data-nav]').forEach(function(btn) {
       btn.addEventListener('click', function() {
         var key = btn.getAttribute('data-nav');
+        if (key === 'memory') {
+          setSidebarOpen(page, false);
+          openSettingsView(page, 'memory');
+          return;
+        }
         var label = NAV_LABELS[key] || '该功能';
         notifyToast('「' + label + '」将在后续阶段接入');
       });
