@@ -1685,6 +1685,8 @@
     };
     var typeTextMap = {
       explicit_memory: '明确记住',
+      explicit_update: '修改记忆',
+      explicit_delete: '遗忘删除',
       extract_memory: '自动提取',
       summarize_chat: '短期摘要'
     };
@@ -1700,6 +1702,19 @@
         ? ('<div class="aiw-mem-task-err">错误：' + escapeHtml(t.lastError) + '</div>')
         : (t.resultSummary ? ('<div class="aiw-mem-task-sub">' + escapeHtml(t.resultSummary) + '</div>') : '');
 
+      var diagLine = '';
+      if (t.diagnostics && typeof t.diagnostics === 'object') {
+        var d = t.diagnostics;
+        var diagParts = [
+          '判断:' + (d.enteredAutoJudgment ? '是' : '否'),
+          '请求模型:' + (d.modelRequested ? '是' : '否'),
+          '候选:' + (d.modelReturnedCandidates ? (d.candidateCount || 1) : 0),
+          '达标:' + (d.passedValueGate ? '是' : '否'),
+          '写库:' + (d.dbWriteAttempted ? (d.dbWriteSucceeded ? ('成功(' + (d.writtenCount || 0) + ')') : '失败') : '未执行')
+        ];
+        diagLine = '<div class="aiw-mem-task-sub" style="opacity:0.85;">' + escapeHtml(diagParts.join(' · ')) + '</div>';
+      }
+
       return (
         '<div class="aiw-mem-task-item is-' + escapeHtml(t.status || 'pending') + '">' +
           '<div class="aiw-mem-task-top">' +
@@ -1711,6 +1726,7 @@
             '<span class="aiw-mem-task-write ' + (t.memoryWritten ? 'is-written' : 'is-unwritten') + '">' + escapeHtml(writtenLabel) + '</span>' +
           '</div>' +
           errLine +
+          diagLine +
         '</div>'
       );
     }).join('');

@@ -65,6 +65,10 @@
       terms: ['叫我', '名字', '称呼', '姓名', '职业', '工作', '岗位', '住在', '城市', '来自']
     },
     {
+      name: 'concept_learning_study',
+      terms: ['学习', '在学', '学什么', '开始学', '进修', '备考', '考研', '考证', '课程', '教材', '日语', '英语', '韩语', '法语', '德语', '西班牙语', '读书', '阅读', '练习', '钢琴', '吉他', '画画', '技能']
+    },
+    {
       name: 'concept_reply_style',
       terms: ['排版', '格式', '风格', '语气', '简短', '详细', '清单', '列表', '先给结论', '中文', '英文']
     }
@@ -90,11 +94,17 @@
       name: 'user_name',
       category: '身份信息',
       cues: ['名字', '叫我', '称呼为', '称为']
+    },
+    {
+      name: 'reply_style',
+      category: '偏好',
+      cues: ['简洁一点的回答', '详尽一点的回答', '简短回答', '详细回答', '回答风格', '回复风格', '简洁的回答', '详细的回答', '言简意赅']
     }
   ];
 
   var _queueRunning = false;
   var _queueRerunRequested = false;
+  var _retryTimer = null;
 
   function S() {
     return global.AiWorkspaceStorage;
@@ -162,6 +172,30 @@
       if (secretPhrasePatterns[j].test(src)) return true;
     }
 
+    return false;
+  }
+
+  function containsHighRiskPrivacy(text) {
+    var src = String(text || '');
+    if (!src.trim()) return false;
+
+    var privacyPatterns = [
+      // 中国居民身份证号（18位或15位）
+      /(?:身份证(?:号|号码)?|证件号)[^\dA-Za-z]{0,8}[1-9]\d{5}(?:19|20)?\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])\d{3}[\dXx]?/,
+      /\b[1-9]\d{5}(?:19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])\d{3}[\dXx]\b/,
+      // 银行卡号 / 信用卡号 / 卡密 / CVV
+      /(?:银行卡(?:号|密码)?|信用卡(?:号|卡号)?|借记卡|储蓄卡|卡号|cvv|cvc)\s*(?:是|为|[:：=]|尾号)?\s*\d{12,19}/i,
+      // 护照 / 社保号 / 医保卡号
+      /(?:护照号|社保号|医保卡号|驾驶证号)\s*(?:是|为|[:：=])?\s*[A-Za-z0-9]{6,}/i,
+      // 精确家庭住址（含门牌/单元/室）+ 电话隐私
+      /(?:家庭住址|详细住址|现住址|身份证地址)\s*(?:是|为|在|[:：=])\s*\S{6,}/,
+      /(?:手机号|电话号码|联系方式)\s*(?:是|为|[:：=])\s*1[3-9]\d{9}/,
+      // 病历/个人高度敏感医疗隐私
+      /(?:病历号|住院号|体检报告|诊断结果|确诊患有|病例隐私)\s*(?:是|为|[:：=]|显示)?\s*\S{2,}/
+    ];
+    for (var i = 0; i < privacyPatterns.length; i++) {
+      if (privacyPatterns[i].test(src)) return true;
+    }
     return false;
   }
 
@@ -335,7 +369,7 @@
   // ===== 4. 相关性评分与跨窗口检索引擎 =====
   function isMetaMemoryQuery(query) {
     var q = String(query || '').toLowerCase();
-    return /(?:你记得|还记得|我之前|之前说过|上次说|关于我|了解我|我的偏好|我的喜好|我的习惯|我的计划|我的项目|我的决定|我的忌口|我的目标|适合我|按我的|根据我的|帮我回忆|我最近在|我正在做|我在开发|我平时|我喜欢|我最喜欢|我爱喝|我爱吃|我用什么|我是做什么的)/.test(q);
+    return /(?:你记得|还记得|我之前|之前说过|上次说|关于我|了解我|我的偏好|我的喜好|我的习惯|我的计划|我的项目|我的决定|我的忌口|我的目标|适合我|按我的|根据我的|帮我回忆|我最近在|我正在做|我在开发|我在学|在学什么|我平时|我喜欢|我最喜欢|我爱喝|我爱吃|我用什么|我是做什么的)/.test(q);
   }
 
   function looksPersonalOrContextualQuery(query) {
@@ -380,17 +414,28 @@
 
     if (metaRecall) {
       var cat = String(category || '');
-      if (/偏好|喜欢|爱喝|爱吃|忌口|口味|水果/.test(rawQueryLower)) {
-        if (cat === '偏好') score += 3.2;
-      } else if (/习惯|作息|平时/.test(rawQueryLower)) {
-        if (cat === '习惯') score += 3.2;
-      } else if (/计划|目标|打算|出差|旅游/.test(rawQueryLower)) {
-        if (cat === '长期计划') score += 3.2;
-      } else if (/项目|开发|制作|软件|应用|系统/.test(rawQueryLower)) {
-        if (cat === '项目') score += 3.5;
-      } else if (/决定/.test(rawQueryLower)) {
-        if (cat === '决定') score += 3.2;
-      } else if (specificBigramHits === 0 && enTermHits === 0 && conceptHits === 0 && extraScope === 'user') {
+      var catBoosted = false;
+      if (/偏好|喜欢|爱喝|爱吃|忌口|口味|水果/.test(rawQueryLower) && cat.indexOf('偏好') !== -1) {
+        score += 3.2;
+        catBoosted = true;
+      }
+      if (/习惯|作息|平时/.test(rawQueryLower) && cat.indexOf('习惯') !== -1) {
+        score += 3.2;
+        catBoosted = true;
+      }
+      if (/计划|目标|打算|出差|旅游|学什么|在学|学习|语言|课程|备考|考证/.test(rawQueryLower) && cat.indexOf('计划') !== -1) {
+        score += 3.2;
+        catBoosted = true;
+      }
+      if (/项目|开发|制作|软件|应用|系统/.test(rawQueryLower) && cat.indexOf('项目') !== -1) {
+        score += 3.5;
+        catBoosted = true;
+      }
+      if (/决定/.test(rawQueryLower) && cat.indexOf('决定') !== -1) {
+        score += 3.2;
+        catBoosted = true;
+      }
+      if (!catBoosted && specificBigramHits === 0 && enTermHits === 0 && conceptHits === 0 && extraScope === 'user') {
         score += 2.1;
       }
     }
@@ -820,28 +865,76 @@
     return emptyResult;
   }
 
-  // ===== 7. 方式 A（用户明确记住指令）与方式 B（普通聊天 AI 自动记忆） =====
-  function detectExplicitMemoryCommand(userText) {
-    var text = String(userText || '').trim();
-    if (!text) return { matched: false };
+  // ===== 7. 智能语义记忆意图识别（轻量规则快速识别 + 模型语义判断兜底） =====
+  var SAVE_CMD_PREFIX_RE = /^(?:好的|嗯+|对了对了|对了|那个|喂)?[\s，,。！!]*?(?:请|麻烦|麻烦你|请你|帮我|帮忙|替我|请帮我|能帮我|可以帮我)?\s*(?:一定要|务必|先)?\s*(?:记住|记忆一下|记一下|记下来|记着点?|记牢|记录一下|存进长期记忆|存入长期记忆|写进长期记忆|记入长期记忆|添加到长期记忆|存进记忆|存到记忆|加入记忆|写入记忆|别忘了|不要忘了|留个底|帮我记|替我记)\s*[：:，,、。\s]*/i;
+  var SAVE_CMD_SUFFIX_RE = /[，,。\s]*(?:这个|这件事)?(?:以后|往后)?(?:请|麻烦|帮我|替我)?(?:记住|记忆一下|记一下|记下来|记着点?|记牢|记录一下|存进记忆|存到记忆|加入记忆|写入记忆|别忘了|不要忘了|留个底)[吧呀呢啊哦了]*\s*(?:好吗|好不好|行吗|可以吗|谢谢|感谢|拜托了|知道了吗)?[？?！!。.\s]*$/i;
 
-    var explicitPatterns = [
-      /^(?:请|麻烦|麻烦你|请你|帮我|帮忙|请帮我|能帮我|可以帮我)?(?:记住|记一下|记下来|记牢|记录一下|存进记忆|存到记忆|加入记忆|写入记忆|别忘了|不要忘了|帮我记|把下面|把这条)/,
-      /(?:帮我记住|请记住|麻烦记住|帮我记一下|请记一下|帮我记下来|记入长期记忆|存入长期记忆|写进长期记忆|添加到长期记忆)/
+  function detectMemoryIntentFast(userText) {
+    var text = String(userText || '').trim();
+    if (!text) return { matched: false, intent: 'none', via: 'none' };
+
+    var deletePatterns = [
+      /^(?:请|麻烦|麻烦你|请你|帮我|帮忙|替我|请帮我|能帮我)?\s*(?:彻底|全部|永远)?\s*(?:忘掉|忘记|遗忘|删掉|删除|清除|清理|抹掉|抹除|移除|取消|别再记|不要再记|不用再记|别记了|不用记了|算了别记)/,
+      /(?:帮我|请|麻烦)?(?:忘掉|忘记|忘了吧|遗忘|删除记忆|删掉记忆|清除记忆|移除记忆|取消记忆|从记忆(?:里|中)?删(?:掉|除)|把.*记忆(?:删掉|删除|清空|清除|忘掉)|不要再记(?:住|得)?|别再记(?:住|得)?|别放记忆里|不要记住)/
     ];
-    for (var i = 0; i < explicitPatterns.length; i++) {
-      if (explicitPatterns[i].test(text)) {
-        return { matched: true };
+    for (var d = 0; d < deletePatterns.length; d++) {
+      if (deletePatterns[d].test(text)) {
+        return { matched: true, intent: 'delete', via: 'rule' };
       }
     }
-    return { matched: false };
+
+    var updatePatterns = [
+      /^(?:请|麻烦|请你|帮我|帮忙)?\s*(?:修改记忆|更新记忆|改一下记忆|更新一下记忆|修正记忆|更正记忆)/,
+      /(?:修改记忆|更新记忆|改一下记忆|更新一下记忆|把记忆(?:里|中)的.*(?:改成|改为|换成))/
+    ];
+    for (var u = 0; u < updatePatterns.length; u++) {
+      if (updatePatterns[u].test(text)) {
+        return { matched: true, intent: 'update', via: 'rule' };
+      }
+    }
+
+    var savePatterns = [
+      /^(?:好的|嗯+|对了|那个)?[\s，,。！!]*?(?:请|麻烦|麻烦你|请你|帮我|帮忙|替我|请帮我|能帮我|可以帮我)?\s*(?:一定要|务必|先)?\s*(?:记住|记忆一下|记一下|记下来|记着点?|记牢|记录一下|存进长期记忆|存入长期记忆|写进长期记忆|记入长期记忆|添加到长期记忆|存进记忆|存到记忆|加入记忆|写入记忆|别忘了|不要忘了|留个底|帮我记|替我记)/,
+      /(?:帮我记住|请记住|麻烦记住|帮我记一下|请记一下|记忆一下|帮我记下来|帮我记着|替我记一下|以后记着|记着点|记入长期记忆|存入长期记忆|写进长期记忆|添加到长期记忆|存进记忆|存到记忆|这个以后记着|这件事别忘了|帮我留个底)/
+    ];
+    for (var s = 0; s < savePatterns.length; s++) {
+      if (savePatterns[s].test(text)) {
+        return { matched: true, intent: 'save', via: 'rule' };
+      }
+    }
+
+    return { matched: false, intent: 'none', via: 'none' };
+  }
+
+  function detectExplicitMemoryCommand(userText) {
+    var fast = detectMemoryIntentFast(userText);
+    return { matched: fast.matched, intent: fast.intent, via: fast.via };
+  }
+
+  function looksLikeSoftMemoryIntent(userText) {
+    var text = String(userText || '').trim();
+    if (!text || text.length < 4) return false;
+    if (isPureGreetingOrFiller(text) || isPureQuestionWithoutFact(text)) return false;
+    return /(?:记忆|记住|记一下|记着|忘掉|忘记|算了.*不要|别再提|不要再提|不再喜欢|以后.*都按|以后我更|从今以后|往后都|刚才说的|前面说的|之前说的|这件事|那件事|留个底)/.test(text);
+  }
+
+  function hasVagueContextReference(text) {
+    var s = String(text || '').trim();
+    if (!s) return true;
+    if (/^(?:这个|那个|上面|前面|刚才|刚刚|这件事|那件事|上述|以上|下面这些|这些|那些|它|这事|那事|刚才那个|刚才说的|刚刚说的|前面说的|上面说的)(?:[，,。\s]*(?:计划|事|事情|东西|内容|决定|偏好))?$/.test(s)) {
+      return true;
+    }
+    if (/(?:上面说的|刚才说的|刚刚说的|前面提到的|前面说的|这个方案|那个方案|刚才那个|这件事|那件事)/.test(s) && s.length <= 28) {
+      return true;
+    }
+    return false;
   }
 
   function inferMemoryCategoryFromText(text) {
     var t = String(text || '');
     if (/(?:喜欢|最喜欢|爱喝|爱吃|最爱|偏好|习惯喝|习惯吃|不喜欢|讨厌|忌口|过敏|改喝|改吃|风格|排版|简短|详尽|清单)/.test(t)) return '偏好';
     if (/(?:每天|每晚|平时|作息|习惯|早起|熬夜|几点睡)/.test(t)) return '习惯';
-    if (/(?:计划|打算|准备去|下周|下个月|明年|目标|出差|旅行|考研|备考)/.test(t)) return '长期计划';
+    if (/(?:计划|打算|准备去|下周|下个月|明年|目标|出差|旅行|考研|备考|开始学|学习|学日语|学英语|考证|进修)/.test(t)) return '长期计划';
     if (/(?:项目|开发|正在做|系统|软件|应用|仓库|产品)/.test(t)) return '项目';
     if (/(?:决定|确定|选定|定下来|不再)/.test(t)) return '决定';
     if (/(?:叫我|我叫|名字|职业|工程师|医生|老师|学生|住在|居住|老家|养了)/.test(t)) return '身份信息';
@@ -872,22 +965,13 @@
     if (!raw) return null;
 
     var stripped = raw
-      .replace(/^(?:好的|嗯+|对了|那个|喂)?[\s，,。！!]*?(?:请|麻烦|麻烦你|请你|帮我|帮忙|请帮我|能帮我|可以帮我)?\s*(?:一定要|务必)?\s*(?:记住|记一下|记下来|记牢|记录一下|存进长期记忆|存到长期记忆|加入长期记忆|写入长期记忆|存到记忆|加入记忆|别忘了|不要忘了|帮我记一下|帮我记)\s*[：:，,、。\s]*/i, '')
-      .replace(/[，,。\s]*(?:记住|记下来|记一下|别忘了|不要忘了)?\s*(?:好吗|好不好|行吗|可以吗|谢谢|感谢|拜托了|知道了吗)[？?！!。.\s]*$/i, '')
+      .replace(SAVE_CMD_PREFIX_RE, '')
+      .replace(SAVE_CMD_SUFFIX_RE, '')
       .trim();
 
     if (!stripped || stripped.length < 2) return null;
-
-    // 若包含指代不明的上下文依赖词，且缺少主语/完整语义，交给模型结合上下文提炼
-    if (/^(?:这个|那个|上面|前面|刚才|刚刚|这件事|那件事|上述|以上|下面这些|这些|那些)/.test(stripped) ||
-        /(?:上面说的|刚才说的|前面提到的|这个方案|那个方案|这件事)/.test(stripped)) {
-      return null;
-    }
-
-    // 剥离“我是一个/我最喜欢…”后如仍为纯问句，则不直接落库
-    if (/[？?]$/.test(stripped) && !/[，。；！]/.test(stripped)) {
-      return null;
-    }
+    if (hasVagueContextReference(stripped)) return null;
+    if (/[？?]$/.test(stripped) && !/[，。；！]/.test(stripped)) return null;
 
     var fact = convertFirstPersonToThirdPerson(stripped);
     fact = fact.replace(/[。！!]+$/, '').trim();
@@ -895,7 +979,10 @@
     if (fact.length > limit) fact = fact.slice(0, limit);
 
     return {
+      intent: 'save',
       action: 'add',
+      shouldSave: true,
+      confidence: 0.95,
       targetId: '',
       content: fact,
       category: inferMemoryCategoryFromText(stripped),
@@ -904,17 +991,405 @@
     };
   }
 
+  function stripDeleteCommandTarget(userText) {
+    var raw = String(userText || '').trim();
+    if (!raw) return '';
+    return raw
+      .replace(/^(?:好的|嗯+|对了)?[\s，,。！!]*?(?:请|麻烦|麻烦你|请你|帮我|帮忙|替我|请帮我|能帮我)?\s*(?:彻底|全部|永远)?\s*(?:忘掉|忘记|遗忘|删掉|删除|清除|清理|抹掉|抹除|移除|取消|别再记|不要再记|不用再记|别记了|不用记了)(?:关于|有关|那条|这条)?\s*[：:，,、。\s]*/i, '')
+      .replace(/(?:这件事|那件事|这个记忆|这条记忆|的记忆|记忆|这事|那事)?[吧呀呢啊哦了]*\s*(?:好吗|好不好|行吗|可以吗|谢谢|感谢|拜托了)?[？?！!。.\s]*$/i, '')
+      .trim();
+  }
+
+  function findRuleBasedDeleteTargets(targetPhrase, existingMemories) {
+    var list = Array.isArray(existingMemories) ? existingMemories : [];
+    if (!targetPhrase || !list.length || hasVagueContextReference(targetPhrase)) return [];
+
+    var normalizedPhrase = normalizeMemoryText(convertFirstPersonToThirdPerson(targetPhrase));
+    var rawNorm = normalizeMemoryText(targetPhrase);
+    var scored = [];
+
+    for (var i = 0; i < list.length; i++) {
+      var mem = list[i];
+      if (!mem || !mem.content) continue;
+      var memNorm = normalizeMemoryText(mem.content);
+      var sim = Math.max(
+        computeTextSimilarity(targetPhrase, mem.content),
+        computeTextSimilarity(convertFirstPersonToThirdPerson(targetPhrase), mem.content)
+      );
+      if (memNorm === normalizedPhrase || (rawNorm.length >= 2 && memNorm.indexOf(rawNorm) !== -1)) {
+        sim = Math.max(sim, 0.92);
+      }
+      if (sim >= 0.45) {
+        scored.push({ memory: mem, score: sim });
+      }
+    }
+
+    scored.sort(function(a, b) { return b.score - a.score; });
+    if (!scored.length) return [];
+    if (scored[0].score >= 0.72) {
+      return [scored[0].memory];
+    }
+    if (scored.length === 1 && scored[0].score >= 0.5) {
+      return [scored[0].memory];
+    }
+    return [];
+  }
+
+  function buildHistoryContextText(historyMessages) {
+    var list = Array.isArray(historyMessages) ? historyMessages : [];
+    if (!list.length) return '';
+    return list.slice(-6).map(function(m) {
+      var role = m && m.role === 'assistant' ? '助手' : '用户';
+      var content = String((m && m.content) || '').trim().slice(0, 260);
+      return content ? (role + '：' + content) : '';
+    }).filter(Boolean).join('\n');
+  }
+
+  function hasIdentifiableHistoryAntecedent(historyMessages) {
+    var list = Array.isArray(historyMessages) ? historyMessages : [];
+    for (var i = list.length - 1; i >= 0; i--) {
+      var m = list[i];
+      if (!m || m.role !== 'user') continue;
+      var txt = String(m.content || '').trim();
+      if (txt.length >= 4 && !isPureGreetingOrFiller(txt) && !hasVagueContextReference(txt) && !detectMemoryIntentFast(txt).matched) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  async function skipQueuedTasksMatchingDeleted(store, deletedMemories) {
+    if (!store || typeof store.listMemoryTasks !== 'function' || !Array.isArray(deletedMemories) || !deletedMemories.length) return;
+    try {
+      var tasks = await store.listMemoryTasks();
+      for (var i = 0; i < tasks.length; i++) {
+        var t = tasks[i];
+        if (!t || (t.status !== 'pending' && t.status !== 'retry_waiting')) continue;
+        var payloadText = String((t.payload && t.payload.userText) || '').trim();
+        if (!payloadText) continue;
+        var third = convertFirstPersonToThirdPerson(payloadText);
+        var hits = deletedMemories.some(function(dm) {
+          return dm && dm.content && (
+            computeTextSimilarity(payloadText, dm.content) >= 0.45 ||
+            computeTextSimilarity(third, dm.content) >= 0.5
+          );
+        });
+        if (hits) {
+          await store.updateMemoryTask(t.id, {
+            status: 'skipped',
+            memoryWritten: false,
+            lastError: '',
+            resultSummary: '用户已要求遗忘该记忆，历史待提取任务已自动取消'
+          });
+        }
+      }
+    } catch (_) {}
+  }
+
+  function normalizeParsedConfidence(val, fallback) {
+    if (val === undefined || val === null || val === '') return fallback;
+    var n = Number(val);
+    if (!Number.isFinite(n)) return fallback;
+    if (n > 1 && n <= 100) n = n / 100;
+    return Math.max(0, Math.min(1, n));
+  }
+
+  function parseStructuredMemoryResponse(rawText) {
+    var parsed = parseExtractorJsonObject(rawText);
+    if (!parsed) return { intent: 'none', items: [], clarificationQuestion: '' };
+
+    if (Array.isArray(parsed)) {
+      return { intent: parsed.length ? 'save' : 'none', items: parsed, clarificationQuestion: '' };
+    }
+    if (typeof parsed !== 'object') {
+      return { intent: 'none', items: [], clarificationQuestion: '' };
+    }
+
+    if (!parsed.memories && parsed.result && typeof parsed.result === 'object') {
+      parsed = parsed.result;
+    } else if (!parsed.memories && parsed.data && typeof parsed.data === 'object') {
+      parsed = parsed.data;
+    } else if (!parsed.memories && parsed.memory && typeof parsed.memory === 'object') {
+      parsed = parsed.memory;
+    }
+
+    var topIntent = String(parsed.intent || parsed.action || '').trim().toLowerCase();
+    var clarMsg = String(parsed.clarificationQuestion || parsed.clarify || '').trim();
+    var topAboutUser = parsed.aboutUser;
+    var topIsDurable = parsed.isDurable;
+    var topFactType = String(parsed.factType || '').trim().toLowerCase();
+    var topConf = normalizeParsedConfidence(parsed.confidence, null);
+    var items = [];
+
+    if (Array.isArray(parsed.memories)) {
+      items = parsed.memories.slice();
+    } else if (
+      topIntent === 'save' ||
+      topIntent === 'update' ||
+      topIntent === 'delete' ||
+      topIntent === 'add' ||
+      parsed.shouldSave === true ||
+      typeof parsed.content === 'string'
+    ) {
+      items = [parsed];
+    }
+
+    if (!topIntent && items.length > 0) {
+      topIntent = String(items[0].intent || items[0].action || (parsed.shouldSave === false ? 'none' : 'save')).toLowerCase();
+    }
+    if (topIntent === 'add') topIntent = 'save';
+
+    return {
+      intent: topIntent || 'none',
+      items: items,
+      clarificationQuestion: clarMsg,
+      confidence: topConf,
+      shouldSave: parsed.shouldSave,
+      aboutUser: topAboutUser,
+      isDurable: topIsDurable,
+      factType: topFactType
+    };
+  }
+
+  async function applyStructuredSemanticDecision(decision, context) {
+    var store = S();
+    if (!store) return { added: [], updated: [], deleted: [], skipped: 0, rejectedByValueGate: 0, blockedSecrets: 0, blockedDeleted: 0 };
+
+    var ctx = context && typeof context === 'object' ? context : {};
+    var userId = String(ctx.userId || 'local_user').trim() || 'local_user';
+    var items = Array.isArray(decision && decision.items) ? decision.items : [];
+    var isExplicit = !!ctx.isExplicit;
+    var minConf = isExplicit ? 0.55 : 0.58;
+
+    if (decision && decision.intent === 'clarify') {
+      return {
+        added: [],
+        updated: [],
+        deleted: [],
+        skipped: 0,
+        rejectedByValueGate: 0,
+        blockedSecrets: 0,
+        blockedDeleted: 0,
+        needsClarification: true,
+        clarificationMessage: decision.clarificationQuestion || '请具体说明你想让我记住或修改哪部分内容？'
+      };
+    }
+
+    if (!isExplicit && decision) {
+      var topFactType = String(decision.factType || '').toLowerCase();
+      if (decision.aboutUser === false || decision.isDurable === false ||
+          topFactType === 'guess' || topFactType === 'hypothesis' || topFactType === 'quote' || topFactType === 'temporary' || topFactType === 'greeting_or_temp') {
+        return {
+          added: [],
+          updated: [],
+          deleted: [],
+          skipped: Math.max(1, items.length),
+          rejectedByValueGate: Math.max(1, items.length),
+          blockedSecrets: 0,
+          blockedDeleted: 0,
+          valueRejectReason: decision.aboutUser === false
+            ? '非用户本人直接事实'
+            : (topFactType === 'guess' || topFactType === 'hypothesis' ? '猜测或假设内容' : (topFactType === 'quote' ? '引用他人内容' : '临时话题或不具持续性'))
+        };
+      }
+    }
+
+    var existingAll = await store.listMemories({ userId: userId });
+    var toUpsert = [];
+    var deleted = [];
+    var skipped = 0;
+    var rejectedByValueGate = 0;
+    var blockedSecrets = 0;
+    var rejectReasons = [];
+
+    for (var i = 0; i < items.length; i++) {
+      var item = items[i];
+      if (!item || typeof item !== 'object') continue;
+
+      var itemIntent = String(item.intent || item.action || decision.intent || 'save').trim().toLowerCase();
+      if (itemIntent === 'add') itemIntent = 'save';
+
+      if (itemIntent === 'clarify') {
+        return {
+          added: [],
+          updated: [],
+          deleted: [],
+          skipped: 0,
+          rejectedByValueGate: 0,
+          blockedSecrets: 0,
+          blockedDeleted: 0,
+          needsClarification: true,
+          clarificationMessage: String(item.clarificationQuestion || decision.clarificationQuestion || '请具体说明你想让我记住或修改哪部分内容？')
+        };
+      }
+
+      if (itemIntent === 'none' || itemIntent === 'skip') {
+        skipped++;
+        continue;
+      }
+
+      if (!isExplicit) {
+        var itemFactType = String(item.factType || (decision && decision.factType) || '').toLowerCase();
+        if (item.aboutUser === false || item.isDurable === false ||
+            itemFactType === 'guess' || itemFactType === 'hypothesis' || itemFactType === 'quote' || itemFactType === 'temporary') {
+          skipped++;
+          rejectedByValueGate++;
+          rejectReasons.push('未通过持续性/用户直接事实价值评估');
+          continue;
+        }
+      }
+
+      var conf = normalizeParsedConfidence(
+        item.confidence !== undefined ? item.confidence : (decision ? decision.confidence : null),
+        0.85
+      );
+      if (Number.isFinite(conf) && conf < minConf) {
+        skipped++;
+        rejectedByValueGate++;
+        rejectReasons.push('置信度低于阈值(' + conf + ' < ' + minConf + ')');
+        continue;
+      }
+
+      if (itemIntent === 'delete') {
+        var delTarget = null;
+        if (item.targetId) {
+          delTarget = existingAll.find(function(m) { return m.id === item.targetId; }) || null;
+        }
+        if (!delTarget && item.content) {
+          var matches = findRuleBasedDeleteTargets(item.content, existingAll);
+          if (matches.length) delTarget = matches[0];
+        }
+        if (delTarget) {
+          var okDel = await store.deleteMemory(delTarget.id);
+          if (okDel) {
+            deleted.push(delTarget);
+            existingAll = existingAll.filter(function(m) { return m.id !== delTarget.id; });
+          }
+        } else {
+          skipped++;
+        }
+        continue;
+      }
+
+      if (item.shouldSave === false) {
+        skipped++;
+        continue;
+      }
+
+      var content = String(item.content || '').trim();
+      if (!content || content.length < 2) {
+        skipped++;
+        continue;
+      }
+      if (containsSensitiveSecret(content) || (!isExplicit && containsHighRiskPrivacy(content))) {
+        blockedSecrets++;
+        continue;
+      }
+
+      toUpsert.push({
+        action: itemIntent === 'update' ? 'update' : 'add',
+        targetId: String(item.targetId || ''),
+        content: content,
+        category: item.category || inferMemoryCategoryFromText(content),
+        importance: item.importance != null ? item.importance : (isExplicit ? 5 : 4),
+        scope: item.scope || 'user'
+      });
+    }
+
+    if (deleted.length > 0) {
+      await skipQueuedTasksMatchingDeleted(store, deleted);
+    }
+
+    var upsertRes = toUpsert.length > 0
+      ? await upsertExtractedMemories(toUpsert, ctx)
+      : { added: [], updated: [], skipped: 0, blockedSecrets: 0, blockedDeleted: 0 };
+
+    return {
+      added: upsertRes.added || [],
+      updated: upsertRes.updated || [],
+      deleted: deleted,
+      skipped: (upsertRes.skipped || 0) + skipped,
+      rejectedByValueGate: rejectedByValueGate,
+      valueRejectReason: rejectReasons[0] || '',
+      blockedSecrets: (upsertRes.blockedSecrets || 0) + blockedSecrets,
+      blockedDeleted: upsertRes.blockedDeleted || 0
+    };
+  }
+
+  async function requestSemanticMemoryJudgment(options) {
+    var opts = options && typeof options === 'object' ? options : {};
+    var store = S();
+    var ai = AI();
+    if (!store || !ai || typeof ai.requestChatCompletion !== 'function') {
+      throw new Error('模型或存储模块未就绪');
+    }
+
+    var userId = String(opts.userId || 'local_user').trim() || 'local_user';
+    var existing = await store.listMemories({ userId: userId });
+    var existingListText = existing.slice(0, 30).map(function(m) {
+      return '- id:' + m.id + ' | [' + m.category + '] ' + m.content;
+    }).join('\n') || '（暂无已有记忆）';
+
+    var historyContextText = buildHistoryContextText(opts.historyMessages);
+    var historyBlock = historyContextText
+      ? ('\n【近期聊天上下文（用于理解“刚才说的/这个/那个”等指代）】\n' + historyContextText + '\n')
+      : '';
+
+    var intentHintLine = opts.intentHint && opts.intentHint !== 'none'
+      ? ('【规则初筛提示】用户本轮表达倾向于「' + opts.intentHint + '」记忆意图，请结合上下文准确判断目标内容或目标记忆 ID。\n')
+      : '';
+
+    var prompt =
+      '你是知屿的智能语义记忆判断器。请理解用户的真实意图（不要求固定句式），判断本轮对话应该执行哪种长期记忆操作。\n' +
+      '可选 intent：\n' +
+      '- "save": 新增值得跨对话长期保留的用户信息（偏好、习惯、长期计划、正在开发的项目、重要决定、身份背景，或用户明确要求记下/记忆一下/留个底/别忘了的内容）。\n' +
+      '- "update": 修改/修正/替代已有某条记忆（如偏好改变、从草莓改口芒果、换城市等），必须在 targetId 填入被替换的已有记忆 ID。\n' +
+      '- "delete": 用户要求忘掉、忘记、删除、取消某条记忆或不再保留某个偏好/事项，必须在 targetId 填入目标已有记忆 ID（如有多条全部匹配可放在 memories 数组中逐条返回）。\n' +
+      '- "clarify": 用户明确要求记住/修改/忘掉“这个/刚才说的”，但上下文中找不到明确可保存的对象时，绝不凭空猜测，返回 intent="clarify" 并填写 clarificationQuestion 询问用户。\n' +
+      '- "none": 普通寒暄（你好/谢谢）、纯通用知识问答、一次性琐事，或置信度较低不确定是否长期有效。\n\n' +
+      '严格规范：\n' +
+      '1) 绝不保存密码、API Key、Token、验证码、私钥、银行卡/证件号。\n' +
+      '2) 若与已有记忆完全重复，返回 intent="none", shouldSave=false。\n' +
+      '3) 请诚实评估 confidence（0~1 之间小数），不确定的内容给低置信度并保持保守。\n\n' +
+      intentHintLine +
+      '【已有记忆】\n' + existingListText + '\n' +
+      historyBlock + '\n' +
+      '【本轮用户输入】\n' + String(opts.userText || '').slice(0, 1200) + '\n\n' +
+      (opts.assistantText ? ('【本轮助手回复摘要】\n' + String(opts.assistantText).slice(0, 400) + '\n\n') : '') +
+      '请只输出合法 JSON 对象，不要有任何多余文字：\n' +
+      '{"intent":"save","shouldSave":true,"content":"用第三人称简练概括，例如：用户最近开始学习日语","category":"长期计划","confidence":0.92,"targetId":"","clarificationQuestion":"","memories":[{"intent":"save","shouldSave":true,"content":"用户最近开始学习日语","category":"长期计划","confidence":0.92,"targetId":"","importance":4,"scope":"user"}]}';
+
+    var res = await ai.requestChatCompletion({
+      apiConfig: opts.apiConfig,
+      temperature: 0.1,
+      maxTokens: 1200,
+      allowReasoningFallback: true,
+      messages: [
+        { role: 'system', content: '你是只输出纯 JSON 的智能语义记忆判断器。输出字段包括 intent(save/update/delete/clarify/none)、shouldSave、content、category、confidence、targetId 与 memories 数组。' },
+        { role: 'user', content: prompt }
+      ]
+    });
+
+    var rawContent = String((res && res.content) || '').trim();
+    if (!rawContent) {
+      throw new Error('模型未返回有效的语义判断结果');
+    }
+    return parseStructuredMemoryResponse(rawContent);
+  }
+
   async function handleExplicitMemoryCommand(options) {
     var opts = options && typeof options === 'object' ? options : {};
     var userText = String(opts.userText || '').trim();
-    var detect = detectExplicitMemoryCommand(userText);
-    if (!detect.matched) {
-      return { isExplicit: false, saved: false, added: [], updated: [] };
+    var fast = detectMemoryIntentFast(userText);
+    var isSoft = !fast.matched && looksLikeSoftMemoryIntent(userText);
+
+    if (!fast.matched && !isSoft) {
+      return { isExplicit: false, intent: 'none', saved: false, added: [], updated: [], deleted: [] };
     }
 
     var store = S();
     if (!store) {
-      return { isExplicit: true, saved: false, error: '存储模块未就绪', added: [], updated: [] };
+      return { isExplicit: true, intent: fast.intent || 'save', saved: false, error: '存储模块未就绪', added: [], updated: [], deleted: [] };
     }
 
     var rawSettings = await store.getMemorySettings();
@@ -924,11 +1399,12 @@
     var projectId = String(opts.projectId || '');
     var userId = String(opts.userId || 'local_user').trim() || 'local_user';
     var turnCreatedAt = Date.now();
+    var historyMessages = Array.isArray(opts.historyMessages) ? opts.historyMessages : [];
 
     // 1) 严格遵守用户设置：若长期记忆已关闭，不得绕过用户设置偷偷保存
-    if (!params.useMemory) {
+    if (!params.useMemory && fast.matched && fast.intent !== 'delete') {
       var skippedTask = await store.enqueueMemoryTask({
-        type: 'explicit_memory',
+        type: fast.intent === 'update' ? 'explicit_update' : 'explicit_memory',
         turnKey: 'exp:' + chatId + ':' + String(opts.userMsgId || turnCreatedAt),
         chatId: chatId,
         chatTitle: chatTitle,
@@ -943,11 +1419,13 @@
       });
       return {
         isExplicit: true,
+        intent: fast.intent,
         saved: false,
         blockedBySetting: true,
         reason: '长期记忆已关闭，本次未保存',
         added: [],
         updated: [],
+        deleted: [],
         task: skippedTask
       };
     }
@@ -970,17 +1448,144 @@
       });
       return {
         isExplicit: true,
+        intent: 'save',
         saved: false,
         blockedSecret: true,
         reason: '包含密码或密钥等敏感信息，已安全拦截',
         added: [],
         updated: [],
+        deleted: [],
         task: secretTask
       };
     }
 
+    // 3) 如果是软意图且无有效 API，退回普通聊天流程（不阻塞用户对话）
+    if (isSoft && (!opts.apiConfig || !opts.apiConfig.url || !opts.apiConfig.key || !opts.apiConfig.model)) {
+      return { isExplicit: false, intent: 'none', saved: false, added: [], updated: [], deleted: [] };
+    }
+
+    // 4) 若属于软意图表达，先调用模型确认到底是不是记忆意图；若模型判定为 none，交回普通聊天
+    if (isSoft) {
+      try {
+        var softDecision = await requestSemanticMemoryJudgment({
+          userText: userText,
+          historyMessages: historyMessages,
+          userId: userId,
+          apiConfig: opts.apiConfig,
+          intentHint: 'none'
+        });
+        if (!softDecision || softDecision.intent === 'none') {
+          return { isExplicit: false, intent: 'none', saved: false, added: [], updated: [], deleted: [] };
+        }
+        if (softDecision.intent === 'clarify') {
+          return {
+            isExplicit: true,
+            intent: 'clarify',
+            saved: false,
+            needsClarification: true,
+            clarificationMessage: softDecision.clarificationQuestion || '你想让我记住或修改哪一条内容呢？请再具体说明一下。',
+            added: [],
+            updated: [],
+            deleted: []
+          };
+        }
+        if (!params.useMemory && softDecision.intent !== 'delete') {
+          return {
+            isExplicit: true,
+            intent: softDecision.intent,
+            saved: false,
+            blockedBySetting: true,
+            reason: '长期记忆已关闭，本次未保存',
+            added: [],
+            updated: [],
+            deleted: []
+          };
+        }
+        var softTaskType = softDecision.intent === 'delete'
+          ? 'explicit_delete'
+          : (softDecision.intent === 'update' ? 'explicit_update' : 'explicit_memory');
+        var softTask = await store.enqueueMemoryTask({
+          type: softTaskType,
+          turnKey: 'exp:' + chatId + ':' + String(opts.userMsgId || turnCreatedAt),
+          chatId: chatId,
+          chatTitle: chatTitle,
+          projectId: projectId,
+          userId: userId,
+          status: 'running',
+          attempts: 0,
+          memoryWritten: false,
+          savedMemoryIds: [],
+          payload: { userText: userText.slice(0, 1200) }
+        });
+        var softApplied = await applyStructuredSemanticDecision(softDecision, {
+          userId: userId,
+          chatId: chatId,
+          chatTitle: chatTitle,
+          projectId: projectId,
+          rawUserText: userText,
+          maxSingleMemoryLength: params.maxSingleMemoryLength,
+          taskCreatedAt: turnCreatedAt,
+          allowOverrideOlderTombstone: true,
+          isExplicit: true
+        });
+        if (softApplied.needsClarification) {
+          await store.updateMemoryTask(softTask.id, {
+            status: 'skipped',
+            attempts: 1,
+            memoryWritten: false,
+            resultSummary: '内容不明确，已提示用户补充说明'
+          });
+          return {
+            isExplicit: true,
+            intent: 'clarify',
+            saved: false,
+            needsClarification: true,
+            clarificationMessage: softApplied.clarificationMessage,
+            added: [],
+            updated: [],
+            deleted: []
+          };
+        }
+        var sAdded = softApplied.added || [];
+        var sUpdated = softApplied.updated || [];
+        var sDeleted = softApplied.deleted || [];
+        var sIds = sAdded.concat(sUpdated).map(function(m) { return m.id; }).filter(Boolean);
+        var sChanged = sIds.length > 0 || sDeleted.length > 0;
+        var sSummary = sDeleted.length > 0
+          ? ('已遗忘并删除 ' + sDeleted.length + ' 条长期记忆')
+          : (sIds.length > 0 ? ('语义识别已写入 ' + sIds.length + ' 条长期记忆') : '长期记忆中已存在或未匹配目标');
+        await store.updateMemoryTask(softTask.id, {
+          status: sChanged ? 'saved' : 'skipped',
+          attempts: 1,
+          memoryWritten: sIds.length > 0,
+          savedMemoryIds: sIds,
+          lastError: '',
+          resultSummary: sSummary
+        });
+        return {
+          isExplicit: true,
+          intent: softDecision.intent,
+          saved: sIds.length > 0,
+          deletedCount: sDeleted.length,
+          alreadyExists: !sChanged && !!softApplied.skipped,
+          reason: sSummary,
+          added: sAdded,
+          updated: sUpdated,
+          deleted: sDeleted,
+          savedIds: sIds
+        };
+      } catch (softErr) {
+        return { isExplicit: false, intent: 'none', saved: false, added: [], updated: [], deleted: [] };
+      }
+    }
+
+    // 5) 快速规则命中明确意图（save / update / delete）
+    var taskType = fast.intent === 'delete'
+      ? 'explicit_delete'
+      : (fast.intent === 'update' ? 'explicit_update' : 'explicit_memory');
+
     var task = await store.enqueueMemoryTask({
-      type: 'explicit_memory',
+      type: taskType,
       turnKey: 'exp:' + chatId + ':' + String(opts.userMsgId || turnCreatedAt),
       chatId: chatId,
       chatTitle: chatTitle,
@@ -994,7 +1599,143 @@
     });
 
     try {
-      var directItem = parseDirectExplicitMemoryFact(userText, params.maxSingleMemoryLength);
+      // 5a) 删除 / 遗忘分支
+      if (fast.intent === 'delete') {
+        var existingForDel = await store.listMemories({ userId: userId });
+        if (!existingForDel.length) {
+          await store.updateMemoryTask(task.id, {
+            status: 'skipped',
+            attempts: 1,
+            memoryWritten: false,
+            resultSummary: '当前长期记忆库为空，无可删除记录'
+          });
+          return {
+            isExplicit: true,
+            intent: 'delete',
+            saved: false,
+            deletedCount: 0,
+            reason: '当前没有可遗忘的长期记忆',
+            added: [],
+            updated: [],
+            deleted: [],
+            task: task
+          };
+        }
+
+        var delPhrase = stripDeleteCommandTarget(userText);
+        var ruleTargets = findRuleBasedDeleteTargets(delPhrase, existingForDel);
+        var deletedList = [];
+
+        if (ruleTargets.length > 0) {
+          for (var rt = 0; rt < ruleTargets.length; rt++) {
+            var removedOk = await store.deleteMemory(ruleTargets[rt].id);
+            if (removedOk) deletedList.push(ruleTargets[rt]);
+          }
+          if (deletedList.length > 0) {
+            await skipQueuedTasksMatchingDeleted(store, deletedList);
+          }
+        } else if (opts.apiConfig && opts.apiConfig.url && opts.apiConfig.key && opts.apiConfig.model) {
+          if (hasVagueContextReference(delPhrase) && !hasIdentifiableHistoryAntecedent(historyMessages)) {
+            await store.updateMemoryTask(task.id, {
+              status: 'skipped',
+              attempts: 1,
+              memoryWritten: false,
+              resultSummary: '遗忘目标不明确，已提示用户确认'
+            });
+            return {
+              isExplicit: true,
+              intent: 'clarify',
+              saved: false,
+              needsClarification: true,
+              clarificationMessage: '请问你想让我忘掉或删除哪一条记忆呢？可以告诉我具体关键词。',
+              added: [],
+              updated: [],
+              deleted: []
+            };
+          }
+          var delDecision = await requestSemanticMemoryJudgment({
+            userText: userText,
+            historyMessages: historyMessages,
+            userId: userId,
+            apiConfig: opts.apiConfig,
+            intentHint: 'delete'
+          });
+          var delApplied = await applyStructuredSemanticDecision(delDecision, {
+            userId: userId,
+            chatId: chatId,
+            chatTitle: chatTitle,
+            projectId: projectId,
+            rawUserText: userText,
+            maxSingleMemoryLength: params.maxSingleMemoryLength,
+            taskCreatedAt: turnCreatedAt,
+            allowOverrideOlderTombstone: true,
+            isExplicit: true
+          });
+          if (delApplied.needsClarification) {
+            await store.updateMemoryTask(task.id, {
+              status: 'skipped',
+              attempts: 1,
+              memoryWritten: false,
+              resultSummary: '遗忘目标不明确，已提示用户确认'
+            });
+            return {
+              isExplicit: true,
+              intent: 'clarify',
+              saved: false,
+              needsClarification: true,
+              clarificationMessage: delApplied.clarificationMessage,
+              added: [],
+              updated: [],
+              deleted: []
+            };
+          }
+          deletedList = delApplied.deleted || [];
+        }
+
+        if (deletedList.length > 0) {
+          var delDoneTask = await store.updateMemoryTask(task.id, {
+            status: 'saved',
+            attempts: 1,
+            memoryWritten: false,
+            savedMemoryIds: [],
+            lastError: '',
+            resultSummary: '已遗忘并删除 ' + deletedList.length + ' 条长期记忆（已记录墓碑防复活）'
+          });
+          return {
+            isExplicit: true,
+            intent: 'delete',
+            saved: false,
+            deletedCount: deletedList.length,
+            deleted: deletedList,
+            added: [],
+            updated: [],
+            task: delDoneTask
+          };
+        }
+
+        var delSkipTask = await store.updateMemoryTask(task.id, {
+          status: 'skipped',
+          attempts: 1,
+          memoryWritten: false,
+          resultSummary: '未在长期记忆中找到匹配的待遗忘内容'
+        });
+        return {
+          isExplicit: true,
+          intent: 'delete',
+          saved: false,
+          deletedCount: 0,
+          reason: '未找到对应的长期记忆，未执行删除',
+          added: [],
+          updated: [],
+          deleted: [],
+          task: delSkipTask
+        };
+      }
+
+      // 5b) 保存 / 修改分支：优先低成本规则直解析；若含模糊指代或复杂表达，结合聊天上下文调用模型语义识别
+      var directItem = fast.intent === 'save'
+        ? parseDirectExplicitMemoryFact(userText, params.maxSingleMemoryLength)
+        : null;
       var writeRes;
 
       if (directItem) {
@@ -1009,42 +1750,90 @@
           allowOverrideOlderTombstone: true
         });
       } else {
-        // 指令依赖上下文或结构复杂时，立即调用模型提取（不等待流式回答完成）
-        writeRes = await extractAndSaveFromTurn({
+        var strippedSave = userText.replace(SAVE_CMD_PREFIX_RE, '').replace(SAVE_CMD_SUFFIX_RE, '').trim();
+        if (hasVagueContextReference(strippedSave || userText) && !hasIdentifiableHistoryAntecedent(historyMessages)) {
+          await store.updateMemoryTask(task.id, {
+            status: 'skipped',
+            attempts: 1,
+            memoryWritten: false,
+            resultSummary: '缺少明确上下文，已提示用户补充要记住的内容'
+          });
+          return {
+            isExplicit: true,
+            intent: 'clarify',
+            saved: false,
+            needsClarification: true,
+            clarificationMessage: '当前对话里还没有可以指代的前文，你想让我记住哪件事呢？',
+            added: [],
+            updated: [],
+            deleted: []
+          };
+        }
+
+        var semDecision = await requestSemanticMemoryJudgment({
           userText: userText,
-          assistantText: opts.contextSnippet || '',
-          historyMessages: opts.historyMessages || [],
+          historyMessages: historyMessages,
+          userId: userId,
+          apiConfig: opts.apiConfig,
+          intentHint: fast.intent
+        });
+        writeRes = await applyStructuredSemanticDecision(semDecision, {
+          userId: userId,
           chatId: chatId,
           chatTitle: chatTitle,
           projectId: projectId,
-          userId: userId,
-          apiConfig: opts.apiConfig,
-          forceExtract: true,
-          ignoreAutoMemoryToggle: true,
+          rawUserText: userText,
+          maxSingleMemoryLength: params.maxSingleMemoryLength,
           taskCreatedAt: turnCreatedAt,
-          allowOverrideOlderTombstone: true
+          allowOverrideOlderTombstone: true,
+          isExplicit: true
         });
+        if (writeRes && writeRes.needsClarification) {
+          await store.updateMemoryTask(task.id, {
+            status: 'skipped',
+            attempts: 1,
+            memoryWritten: false,
+            resultSummary: '内容不明确，已提示用户补充说明'
+          });
+          return {
+            isExplicit: true,
+            intent: 'clarify',
+            saved: false,
+            needsClarification: true,
+            clarificationMessage: writeRes.clarificationMessage,
+            added: [],
+            updated: [],
+            deleted: []
+          };
+        }
       }
 
       var added = (writeRes && writeRes.added) || [];
       var updated = (writeRes && writeRes.updated) || [];
+      var deletedFromUpdate = (writeRes && writeRes.deleted) || [];
       var savedIds = added.concat(updated).map(function(m) { return m && m.id; }).filter(Boolean);
       var hasWritten = savedIds.length > 0;
 
-      if (hasWritten) {
+      if (hasWritten || deletedFromUpdate.length > 0) {
+        var okMsg = deletedFromUpdate.length > 0
+          ? ('已删除 ' + deletedFromUpdate.length + ' 条长期记忆')
+          : ('明确指令已写入 ' + savedIds.length + ' 条长期记忆');
         var savedTask = await store.updateMemoryTask(task.id, {
           status: 'saved',
           attempts: 1,
-          memoryWritten: true,
+          memoryWritten: hasWritten,
           savedMemoryIds: savedIds,
           lastError: '',
-          resultSummary: '明确指令已写入 ' + savedIds.length + ' 条长期记忆'
+          resultSummary: okMsg
         });
         return {
           isExplicit: true,
-          saved: true,
+          intent: fast.intent,
+          saved: hasWritten,
+          deletedCount: deletedFromUpdate.length,
           added: added,
           updated: updated,
+          deleted: deletedFromUpdate,
           savedIds: savedIds,
           task: savedTask
         };
@@ -1063,11 +1852,13 @@
       });
       return {
         isExplicit: true,
+        intent: fast.intent,
         saved: false,
         alreadyExists: !!(writeRes && writeRes.skipped),
         reason: skipMsg,
         added: [],
         updated: [],
+        deleted: [],
         task: skipTask
       };
     } catch (err) {
@@ -1078,37 +1869,48 @@
         memoryWritten: false,
         savedMemoryIds: [],
         lastError: errMsg,
-        resultSummary: '明确记忆保存失败'
+        resultSummary: '明确记忆操作失败'
       });
       return {
         isExplicit: true,
+        intent: fast.intent,
         saved: false,
         error: errMsg,
         added: [],
         updated: [],
+        deleted: [],
         task: failedTask
       };
     }
   }
 
-  // ===== 8. 方式 B：宽松自然语言候选筛选与偏好冲突替换 =====
+  // ===== 8. 方式 B：AI 主动长期记忆（轻量筛选 + 价值评估 + 高确定性结构化提取 + 去重更新） =====
   function isPureGreetingOrFiller(text) {
     var trimmed = String(text || '').trim();
-    return /^(?:你好|您好|hi+|hello+|hey|在吗|在不在|早上好|早安|中午好|下午好|晚上好|晚安|谢谢|感谢|多谢|好的|好吧|好呀|好滴|嗯+|嗯嗯|哦+|行|行吧|可以|没问题|收到|明白|知道了|了解|哈哈+|呵呵|ok+|yes|no|bye|再见|拜拜)[！!。.~～\s]*$/i.test(trimmed);
+    if (/^(?:你好|您好|hi+|hello+|hey|在吗|在不在|早上好|早安|中午好|下午好|晚上好|晚安|谢谢|感谢|多谢|好的|好吧|好呀|好滴|嗯+|嗯嗯|哦+|行|行吧|可以|没问题|收到|明白|知道了|了解|哈哈+|呵呵|ok+|yes|no|bye|再见|拜拜)[！!。.~～\s]*$/i.test(trimmed)) {
+      return true;
+    }
+    if (/^(?:你好|您好|hi+|hello+|早安|晚上好)[，,\s]*(?:今天怎么样|最近怎么样|过得怎么样|在忙什么|吃了吗|好久不见)[？?！!。.~～\s]*$/i.test(trimmed)) {
+      return true;
+    }
+    return false;
+  }
+
+  function hasClearSelfFactCue(text) {
+    return /(?:我|本人|我的).{0,14}(?:喜欢|最喜欢|偏爱|偏好|爱吃|爱喝|习惯|开始学|开始学习|正在学|在学|正在开发|在开发|正在做|在做|准备长期|准备学|打算|计划|决定|长期目标|不吃|忌口|过敏|住在|从事|职业是)/.test(String(text || ''));
   }
 
   function isClauseQuestion(cl) {
     var c = String(cl || '').trim();
     if (!c) return true;
-    if (/[？?]$/.test(c)) return true;
     var bare = c.replace(/[？?！!。.~～]+$/, '').trim();
+    if (hasClearSelfFactCue(bare)) {
+      return false;
+    }
+    if (/[？?]$/.test(c)) return true;
     if (/(?:吗|呢|嘛)$/.test(bare)) return true;
     if (/(?:什么|哪个|哪些|哪里|哪儿|谁|几岁|几个|多少|怎么|如何|为什么|为何|是不是|能不能|可不可以|有没有|帮我推荐|推荐一款|推荐个|解释一下|什么是)/.test(bare)) {
-      // 若同句带强陈述自述（如“我最喜欢草莓，为什么…”已提前拆句，这里是单句检查），
-      // 只在不含第一人称偏好声明时判定为问句
-      if (!/(?:我|我的|本人).{0,10}(?:喜欢|最喜欢|爱吃|爱喝|偏好|习惯|计划|打算|决定|正在做|在开发|住在|叫)/.test(bare)) {
-        return true;
-      }
+      return true;
     }
     return false;
   }
@@ -1128,28 +1930,174 @@
     return true;
   }
 
+  function isGuessHypothesisOrThirdPartyQuote(text) {
+    var src = String(text || '').trim();
+    if (!src) return false;
+    // 明确假设/猜测语气
+    if (/^(?:如果|假如|假设|万一|要是我|设想|比方说|比如我|大概|也许|可能只是|说不定|随便说说|开玩笑地说)/.test(src)) {
+      return true;
+    }
+    if (/(?:如果|假如|假设|万一).{0,24}(?:的话|怎么办|会怎样|岂不是)/.test(src)) {
+      return true;
+    }
+    // 明确引用他人/书本/网上内容且未声明用户本人事实
+    if (/^(?:他|她|它|我朋友|朋友|同事|同学|我妈|我爸|家人|老板|别人|网友|书里|小说里|文章里|老师|客户|听说)/.test(src) &&
+        !/(?:但我|不过我|我也|而我)(?:喜欢|偏好|习惯|正在|打算|计划|决定)/.test(src)) {
+      return true;
+    }
+    return false;
+  }
+
+  function cleanHighCertaintyClauseTail(raw) {
+    return String(raw || '')
+      .replace(/^(?:的是|是|了|着|过)\s*/, '')
+      .replace(/[了呀啊呢吧哦啦呗。！!]+$/, '')
+      .trim();
+  }
+
+  function extractHighCertaintyFactCandidates(userText, maxLen) {
+    var src = String(userText || '').trim();
+    if (!src || src.length < 4) return [];
+    if (containsSensitiveSecret(src) || containsHighRiskPrivacy(src)) return [];
+    if (isPureGreetingOrFiller(src) || isPureQuestionWithoutFact(src)) return [];
+    if (isGuessHypothesisOrThirdPartyQuote(src)) return [];
+
+    var clauses = src.split(/[。；;！!\n]+/).map(function(s) { return s.trim(); }).filter(Boolean);
+    var limit = Math.max(60, Number(maxLen) || DEFAULT_MAX_MEM_LENGTH);
+    var out = [];
+    var seen = new Set();
+
+    function pushCandidate(content, category, importance) {
+      var text = String(content || '').replace(/[。！!]+$/, '').trim();
+      if (!text || text.length < 4) return;
+      if (text.length > limit) text = text.slice(0, limit);
+      var norm = normalizeMemoryText(text);
+      if (!norm || seen.has(norm)) return;
+      seen.add(norm);
+      out.push({
+        intent: 'save',
+        action: 'add',
+        shouldSave: true,
+        aboutUser: true,
+        isDurable: true,
+        factType: 'direct_fact',
+        confidence: 0.9,
+        content: text,
+        category: category,
+        importance: importance || 4,
+        scope: 'user',
+        via: 'high_certainty_rule'
+      });
+    }
+
+    for (var i = 0; i < clauses.length; i++) {
+      var cl = clauses[i];
+      if (!cl || cl.length < 4) continue;
+      if (isClauseQuestion(cl) || isGuessHypothesisOrThirdPartyQuote(cl)) continue;
+
+      // 1) 持续学习 / 开始学习 / 长期学习计划
+      var mStartLearn = cl.match(/^(?:我|本人)(?:最近|刚刚|刚|现在|这几天|这阵子)?(?:开始)(?:学习|学)([^，,。；;！!\n]{1,36})/);
+      if (mStartLearn && mStartLearn[1]) {
+        var subj1 = cleanHighCertaintyClauseTail(mStartLearn[1]);
+        if (subj1 && !/^(?:怎么|什么|如何)/.test(subj1)) {
+          pushCandidate('用户最近开始学习' + subj1, '长期计划', 4);
+          continue;
+        }
+      }
+
+      var mLongLearn = cl.match(/^(?:我|本人)(?:以后|今后|往后|接下来|未来|目前)?(?:准备|打算|计划|决定|想要|要)(?:长期|持续)?(?:学习|学|进修|备考|练习)([^，,。；;！!\n]{1,36})/);
+      if (mLongLearn && mLongLearn[1]) {
+        var subj2 = cleanHighCertaintyClauseTail(mLongLearn[1]);
+        if (subj2 && !/^(?:怎么|什么|如何)/.test(subj2)) {
+          var hasLongPrefix = /以后|长期|今后|往后/.test(cl);
+          pushCandidate(hasLongPrefix ? ('用户以后准备长期学习' + subj2) : ('用户计划学习' + subj2), '长期计划', 4);
+          continue;
+        }
+      }
+
+      var mOngoingLearn = cl.match(/^(?:我|本人)(?:一直在|正在|每天都在)(?:学习|学|练习)([^，,。；;！!\n]{1,36})/);
+      if (mOngoingLearn && mOngoingLearn[1]) {
+        var subj3 = cleanHighCertaintyClauseTail(mOngoingLearn[1]);
+        if (subj3) {
+          pushCandidate('用户正在持续学习' + subj3, '长期计划', 4);
+          continue;
+        }
+      }
+
+      // 2) 正在进行的项目
+      var mProject = cl.match(/^(?:我|本人)(?:目前|现在|最近)?(?:正在|在)(?:开发|制作|研发|搭建|编写|筹备|推进)([^，,。；;！!\n]{2,48})/);
+      if (mProject && mProject[1]) {
+        var projTail = cleanHighCertaintyClauseTail(mProject[1]);
+        if (projTail && /(?:软件|应用|app|工具|系统|网站|项目|产品|插件|小程序|游戏|脚本|模型|工作空间|名叫|叫做)/i.test(cl)) {
+          var verbMatch = cl.match(/(开发|制作|研发|搭建|编写|筹备|推进)/);
+          var verb = verbMatch ? verbMatch[1] : '开发';
+          pushCandidate('用户正在' + verb + projTail, '项目', 4);
+          continue;
+        }
+      }
+
+      // 3) 长期偏好与习惯（回答风格、饮食偏好、常用工具等）
+      var mPref = cl.match(/^(?:我|本人)(?:平时|一般|通常|向来|一直)?(?:比较|更|最)?(?:喜欢|偏爱|偏好|爱吃|爱喝|习惯|倾向于)([^，,。；;！!\n]{2,45})/);
+      if (mPref && mPref[1] && !/(?:今天|昨天|刚才|那部|那个电影|这首)/.test(cl)) {
+        var prefFull = convertFirstPersonToThirdPerson(cl.replace(/[。！!]+$/, ''));
+        var prefCat = /平时|每天|每晚|作息|早起|熬夜/.test(cl) && !/喜欢|偏爱|偏好/.test(cl) ? '习惯' : '偏好';
+        pushCandidate(prefFull, prefCat, 4);
+        continue;
+      }
+
+      // 4) 忌口 / 过敏 / 长期不吃不喝
+      var mAvoid = cl.match(/^(?:我|本人)(?:平时|向来|一直)?(?:不吃|忌口|过敏|讨厌|不爱吃|不爱喝|不喜欢吃|不喜欢喝)([^，,。；;！!\n]{1,32})/);
+      if (mAvoid && mAvoid[1]) {
+        pushCandidate(convertFirstPersonToThirdPerson(cl.replace(/[。！!]+$/, '')), '偏好', 4);
+        continue;
+      }
+
+      // 5) 长期目标 / 重要决定
+      var mGoal = cl.match(/^(?:我|本人)(?:的长期目标是|长期目标是|已经决定|决定以后|计划以后|打算以后)([^，,。；;！!\n]{2,45})/);
+      if (mGoal && mGoal[1]) {
+        var goalText = convertFirstPersonToThirdPerson(cl.replace(/[。！!]+$/, ''));
+        pushCandidate(goalText, /决定/.test(cl) ? '决定' : '长期计划', 4);
+      }
+    }
+
+    return out;
+  }
+
   function analyzeMemoryCandidate(userText) {
     var text = String(userText || '').trim();
-    if (text.length < 3) return { shouldExtract: false, reason: 'too_short' };
+    if (text.length < 3) return { shouldExtract: false, reason: 'too_short', label: '内容过短（不足3字）' };
 
     if (containsSensitiveSecret(text)) {
-      return { shouldExtract: false, blockedSecret: true, reason: 'sensitive_secret' };
+      return { shouldExtract: false, blockedSecret: true, reason: 'sensitive_secret', label: '包含密码/密钥/验证码等敏感信息，已安全拦截' };
+    }
+
+    if (containsHighRiskPrivacy(text)) {
+      return { shouldExtract: false, blockedPrivacy: true, reason: 'high_risk_privacy', label: '包含高度敏感个人隐私，未经明确许可不自动保存' };
     }
 
     if (isPureGreetingOrFiller(text)) {
-      return { shouldExtract: false, reason: 'greeting_or_filler' };
+      return { shouldExtract: false, reason: 'greeting_or_filler', label: '普通寒暄或客套语，无需保存' };
     }
 
     if (isPureQuestionWithoutFact(text)) {
-      return { shouldExtract: false, reason: 'pure_question' };
+      return { shouldExtract: false, reason: 'pure_question', label: '一次性提问且无用户长期事实，无需保存' };
     }
 
-    if (detectExplicitMemoryCommand(text).matched) {
-      return { shouldExtract: true, reason: 'explicit_save' };
+    if (isGuessHypothesisOrThirdPartyQuote(text)) {
+      return { shouldExtract: false, reason: 'guess_or_quote', label: '属于猜测、假设或引用他人内容，不作为本人长期记忆保存' };
     }
 
-    // 只要不是纯寒暄和纯问句，且达到有效表达长度，就交给模型判断是否有长期价值（不再依赖死板的关键词正则）
-    return { shouldExtract: true, reason: 'natural_statement' };
+    var fast = detectMemoryIntentFast(text);
+    if (fast.matched) {
+      return { shouldExtract: true, reason: 'explicit_' + fast.intent, label: '命中明确记忆指令' };
+    }
+
+    var highCert = extractHighCertaintyFactCandidates(text);
+    if (highCert.length > 0) {
+      return { shouldExtract: true, reason: 'high_certainty_fact', label: '命中高确定性长期用户事实候选' };
+    }
+
+    return { shouldExtract: true, reason: 'natural_statement', label: '包含自然陈述，进入模型语义价值判断' };
   }
 
   function shouldAttemptExtraction(userText) {
@@ -1184,7 +2132,7 @@
 
   function findContradictionOrMergeTarget(content, category, sameScopeMemories, rawUserText) {
     var slot = detectMutualSlot(content, category);
-    var hasChangeCue = /(?:改成|改为|换成|换喝|改喝|改吃|不再|以前.*现在|转成|其实更喜欢|现在更喜欢)/.test(String(content || '') + ' ' + String(rawUserText || ''));
+    var hasChangeCue = /(?:改成|改为|换成|换喝|改喝|改吃|不再|以前.*现在|转成|其实更喜欢|现在更喜欢|以后我更喜欢|平时更喜欢|更偏向)/.test(String(content || '') + ' ' + String(rawUserText || ''));
 
     if (slot) {
       var slotMatches = sameScopeMemories.filter(function(m) {
@@ -1201,6 +2149,7 @@
           hasChangeCue ||
           slot.indexOf('pref_subject:') === 0 ||
           slot === 'coffee_drink' ||
+          slot === 'reply_style' ||
           slot === 'user_location' ||
           slot === 'user_name'
         ) {
@@ -1252,7 +2201,7 @@
     for (var i = 0; i < (Array.isArray(candidates) ? candidates.length : 0); i++) {
       var rawItem = candidates[i];
       if (!rawItem || typeof rawItem !== 'object') continue;
-      if (rawItem.action === 'skip') {
+      if (rawItem.action === 'skip' || rawItem.intent === 'none' || rawItem.shouldSave === false) {
         skipped++;
         continue;
       }
@@ -1266,14 +2215,11 @@
         content = content.slice(0, maxLen);
       }
 
-      if (containsSensitiveSecret(content)) {
+      if (containsSensitiveSecret(content) || (!ctx.isExplicit && containsHighRiskPrivacy(content))) {
         blockedSecrets++;
         continue;
       }
 
-      // 墓碑防复活保护：
-      // 1) 任何延迟任务若早于删除时间戳，或普通自动提取命中墓碑，一律拦截；
-      // 2) 仅当用户之后主动发出新的明确记忆指令（taskCreatedAt > sig.deletedAt 且 allowOverrideOlderTombstone）才清除旧墓碑允许再次保存。
       var hitSig = findBlockingDeletedSignature(content, deletedSigs);
       if (hitSig) {
         var canOverride = !!(ctx.allowOverrideOlderTombstone && taskCreatedAt > (hitSig.deletedAt || 0));
@@ -1291,13 +2237,13 @@
       if (scope !== 'user' && scope !== 'chat' && scope !== 'project') scope = 'user';
       if (scope === 'project' && !projectId) scope = 'user';
 
-      var category = rawItem.category || '备忘';
+      var category = rawItem.category || inferMemoryCategoryFromText(content);
       var sameScopeMemories = existingAll.filter(function(m) {
         return m.scope === scope && (scope !== 'project' || m.projectId === projectId);
       });
 
       var matchedTarget = null;
-      if (rawItem.action === 'update' && rawItem.targetId) {
+      if ((rawItem.action === 'update' || rawItem.intent === 'update') && rawItem.targetId) {
         matchedTarget = sameScopeMemories.find(function(m) { return m.id === rawItem.targetId; }) || null;
       }
 
@@ -1355,7 +2301,6 @@
     };
   }
 
-  // 先剥离推理模型的 <think>...</think> 块，再截取平衡括号 JSON
   function stripReasoningThinkTags(raw) {
     var s = String(raw || '').trim();
     s = s.replace(/<think>[\s\S]*?<\/think>/gi, '');
@@ -1420,104 +2365,215 @@
     return text.slice(startIdx);
   }
 
-  function parseExtractorJsonObject(rawText) {
-    var slice = extractBalancedJsonSlice(rawText);
+  function safeJsonParseWithRepair(slice) {
     if (!slice) return null;
     try {
       return JSON.parse(slice);
     } catch (_) {
-      return null;
+      try {
+        var repaired = String(slice)
+          .replace(/,\s*([}\]])/g, '$1')
+          .replace(/[\u0000-\u0019]+/g, ' ');
+        return JSON.parse(repaired);
+      } catch (_2) {
+        return null;
+      }
     }
   }
 
-  function parseExtractorJson(rawText) {
+  function parseExtractorJsonObject(rawText) {
     var slice = extractBalancedJsonSlice(rawText);
-    if (!slice) return [];
-    var parsed = JSON.parse(slice);
-    if (Array.isArray(parsed)) return parsed;
-    if (parsed && Array.isArray(parsed.memories)) return parsed.memories;
-    if (parsed && typeof parsed.content === 'string') return [parsed];
-    return [];
+    var obj = safeJsonParseWithRepair(slice);
+    if (obj) return obj;
+
+    // 兜底：若前面有干扰碎片，尝试从最后一个 `{` 匹配完整 JSON
+    var cleaned = stripReasoningThinkTags(rawText);
+    var idx = cleaned.lastIndexOf('{');
+    while (idx > 0) {
+      var candidate = extractBalancedJsonSlice(cleaned.slice(idx));
+      var parsed = safeJsonParseWithRepair(candidate);
+      if (parsed && typeof parsed === 'object') return parsed;
+      idx = cleaned.lastIndexOf('{', idx - 1);
+    }
+    return null;
   }
 
-  async function extractAndSaveFromTurn(options) {
+  function parseExtractorJson(rawText) {
+    var parsedRes = parseStructuredMemoryResponse(rawText);
+    return parsedRes.items || [];
+  }
+
+  async function evaluateProactiveMemoryTurn(options) {
     var opts = options && typeof options === 'object' ? options : {};
     var store = S();
     var ai = AI();
     if (!store || !ai || typeof ai.requestChatCompletion !== 'function') {
-      return { added: [], updated: [], skipped: 0, blockedSecrets: 0, blockedDeleted: 0 };
-    }
-
-    var settings = await store.getMemorySettings();
-    var params = resolveMemoryParams(settings);
-    if (!params.useMemory) {
-      return { added: [], updated: [], skipped: 0, blockedSecrets: 0, blockedDeleted: 0, disabledReason: 'useMemory_off' };
-    }
-    if (!opts.ignoreAutoMemoryToggle && !params.autoMemory) {
-      return { added: [], updated: [], skipped: 0, blockedSecrets: 0, blockedDeleted: 0, disabledReason: 'autoMemory_off' };
-    }
-
-    var userText = String(opts.userText || '').trim();
-    var candidateCheck = analyzeMemoryCandidate(userText);
-    if (candidateCheck.blockedSecret) {
-      return { added: [], updated: [], skipped: 0, blockedSecrets: 1, blockedDeleted: 0 };
-    }
-    if (!candidateCheck.shouldExtract && !opts.forceExtract) {
-      return { added: [], updated: [], skipped: 0, blockedSecrets: 0, blockedDeleted: 0 };
+      throw new Error('模型或存储模块未就绪');
     }
 
     var userId = String(opts.userId || 'local_user').trim() || 'local_user';
     var existing = await store.listMemories({ userId: userId });
-    var existingListText = existing.slice(0, 25).map(function(m) {
+    var existingListText = existing.slice(0, 28).map(function(m) {
       return '- id:' + m.id + ' | [' + m.category + '] ' + m.content;
     }).join('\n') || '（暂无已有记忆）';
 
-    var historyContextText = '';
-    if (Array.isArray(opts.historyMessages) && opts.historyMessages.length) {
-      historyContextText = '\n【近期上下文（供指代消解）】\n' + opts.historyMessages.slice(-4).map(function(m) {
-        return (m.role === 'user' ? '用户' : '助手') + '：' + String(m.content || '').slice(0, 200);
-      }).join('\n') + '\n';
-    }
+    var historyContextText = buildHistoryContextText(opts.historyMessages);
+    var historyBlock = historyContextText
+      ? ('\n【近期聊天上下文】\n' + historyContextText + '\n')
+      : '';
 
     var prompt =
-      '你是一个高精度的长期记忆提取器。请从下面这轮对话中判断是否包含值得长期保存给未来新对话复用的用户信息。\n' +
-      '只提取以下类型：\n' +
-      '- 偏好（饮食水果饮品、工具技术、写作排版风格、兴趣爱好等）\n' +
-      '- 习惯（作息、工作学习方式等）\n' +
-      '- 长期计划（学习/旅行/出差/成长目标等）\n' +
-      '- 项目（正在开发或进行的长期项目名称与背景）\n' +
-      '- 决定（重要长期决定）\n' +
-      '- 身份信息（用户自报称呼、职业、居住地等）\n' +
-      '- 备忘（用户明确要求记住的事项）\n\n' +
-      '若仅仅是寒暄（如你好/谢谢）、纯通用知识问答或一次性临时琐事，请输出 {"memories":[]}。\n' +
-      '严格禁止保存：密码、API Key、Token、验证码、私钥、银行卡/证件号。\n' +
-      '冲突与更新规则（非常重要）：\n' +
-      '1) 如果新信息与已有记忆重复，请输出 {"memories":[]}。\n' +
-      '2) 如果新信息修正、改口或替代了某条已有记忆（例如最喜欢的水果从草莓改为芒果、饮品从冰美式改为热拿铁、搬家等），必须使用 action="update" 并填写被替代记忆的 targetId！\n\n' +
+      '你是知屿的「主动长期记忆价值评估器」。在普通聊天中，无需用户说出“记住”二字，请主动判断用户这句话里是否包含值得跨会话长期保存的信息。\n\n' +
+      '【应该自动保存的高价值信息（务必积极识别）】\n' +
+      '1. 用户的长期偏好与习惯（如：喜欢简洁一点的回答、饮食口味偏好、常用语言/工具、作息习惯）。\n' +
+      '2. 用户正在进行的项目（如：正在开发一款名叫知屿的软件、正在写毕业论文、正在筹备某个产品）。\n' +
+      '3. 用户持续学习的内容（如：最近开始学习日语、准备长期学习编程、在备考某证书）。\n' +
+      '4. 用户的重要计划、长期目标与决定（如：以后准备长期学习编程、下月去某地出差、决定换技术栈）。\n' +
+      '5. 对未来聊天有帮助的稳定个人背景信息（职业、称呼、技能栈、长期约束）。\n\n' +
+      '【绝不保存的内容】\n' +
+      '1. 普通寒暄（你好、今天怎么样、晚安、谢谢）或一次性通用提问。\n' +
+      '2. 猜测、假设（如果/假如/也许）、他人经历或引述文章/朋友的话（非用户本人直接事实）。\n' +
+      '3. 密码、API Key、验证码、身份证/银行卡、病历隐私等敏感信息。\n' +
+      '4. 与【已有记忆】完全重复的内容（但若用户明确改变旧偏好，请使用 intent="update" 并填入对应 targetId）。\n\n' +
       '【已有记忆】\n' + existingListText + '\n' +
-      historyContextText + '\n' +
-      '【本轮用户输入】\n' + userText.slice(0, 1200) + '\n\n' +
-      '【本轮助手回复摘要】\n' + String(opts.assistantText || '').slice(0, 500) + '\n\n' +
-      '请只输出合法 JSON 对象，不要包含任何多余说明：\n' +
-      '{"memories":[{"action":"add","targetId":"","content":"用第三人称简练概括，例如：用户最喜欢的水果是草莓","category":"偏好","importance":4,"scope":"user"}]}';
+      historyBlock + '\n' +
+      '【本轮用户输入】\n' + String(opts.userText || '').slice(0, 1200) + '\n\n' +
+      (opts.assistantText ? ('【本轮助手回复摘要】\n' + String(opts.assistantText).slice(0, 320) + '\n\n') : '') +
+      '请只输出合法 JSON（不要多余解释）：\n' +
+      '{"shouldSave":true,"intent":"save","factType":"direct_fact","aboutUser":true,"isDurable":true,"confidence":0.92,"memories":[{"intent":"save","targetId":"","content":"用第三人称简练概括，例如：用户最近开始学习日语","category":"长期计划","importance":4,"confidence":0.92,"scope":"user"}]}';
 
     var res = await ai.requestChatCompletion({
       apiConfig: opts.apiConfig,
       temperature: 0.1,
-      maxTokens: 1200,
-      allowReasoningFallback: true,
+      maxTokens: 2048,
+      allowReasoningFallback: false,
       messages: [
-        { role: 'system', content: '你是只输出纯 JSON 的长期记忆结构化提取器。如果没有值得保存的信息，请输出 {"memories":[]}。' },
+        { role: 'system', content: '你是只输出合法 JSON 的主动记忆价值评估器。区分用户直接陈述(direct_fact)与猜测(guess)/假设(hypothesis)/引述他人(quote)/临时寒暄(greeting_or_temp)。' },
         { role: 'user', content: prompt }
       ]
     });
 
     var rawContent = String((res && res.content) || '').trim();
     if (!rawContent) {
-      throw new Error('模型未返回有效的提取结果');
+      return { intent: 'none', shouldSave: false, items: [], rawEmpty: true };
     }
-    var candidates = parseExtractorJson(rawContent);
-    return await upsertExtractedMemories(candidates, {
+    var parsed = parseStructuredMemoryResponse(rawContent);
+    return parsed;
+  }
+
+  async function extractAndSaveFromTurn(options) {
+    var opts = options && typeof options === 'object' ? options : {};
+    var store = S();
+    var diag = {
+      enteredAutoJudgment: true,
+      skipStage: '',
+      skipReason: '',
+      modelRequested: false,
+      modelReturnedCandidates: false,
+      candidateCount: 0,
+      passedValueGate: false,
+      candidateSource: 'none',
+      dbWriteAttempted: false,
+      dbWriteSucceeded: false,
+      writtenCount: 0,
+      writtenMemoryIds: []
+    };
+
+    if (!store) {
+      diag.skipStage = 'no_store';
+      diag.skipReason = '存储模块未就绪';
+      return { added: [], updated: [], deleted: [], skipped: 0, blockedSecrets: 0, blockedDeleted: 0, diagnostics: diag };
+    }
+
+    var settings = await store.getMemorySettings();
+    var params = resolveMemoryParams(settings);
+    if (!params.useMemory) {
+      diag.skipStage = 'setting_disabled';
+      diag.skipReason = '长期记忆开关已关闭';
+      return { added: [], updated: [], deleted: [], skipped: 0, blockedSecrets: 0, blockedDeleted: 0, disabledReason: 'useMemory_off', diagnostics: diag };
+    }
+    if (!opts.ignoreAutoMemoryToggle && !params.autoMemory) {
+      diag.skipStage = 'setting_disabled';
+      diag.skipReason = '自动记忆开关已关闭';
+      return { added: [], updated: [], deleted: [], skipped: 0, blockedSecrets: 0, blockedDeleted: 0, disabledReason: 'autoMemory_off', diagnostics: diag };
+    }
+
+    var userText = String(opts.userText || '').trim();
+    var candidateCheck = analyzeMemoryCandidate(userText);
+    if (candidateCheck.blockedSecret || candidateCheck.blockedPrivacy) {
+      diag.skipStage = 'privacy_guard';
+      diag.skipReason = candidateCheck.label || '敏感信息安全拦截';
+      return { added: [], updated: [], deleted: [], skipped: 0, blockedSecrets: 1, blockedDeleted: 0, diagnostics: diag };
+    }
+    if (!candidateCheck.shouldExtract && !opts.forceExtract) {
+      diag.skipStage = 'lightweight_filter';
+      diag.skipReason = candidateCheck.label || candidateCheck.reason || '轻量筛选未命中长期记忆价值';
+      return { added: [], updated: [], deleted: [], skipped: 0, blockedSecrets: 0, blockedDeleted: 0, diagnostics: diag };
+    }
+
+    var userId = String(opts.userId || 'local_user').trim() || 'local_user';
+    var highCertaintyItems = !opts.forceExtract
+      ? extractHighCertaintyFactCandidates(userText, params.maxSingleMemoryLength)
+      : [];
+
+    var decision = null;
+    var hasUsableApi = !!(
+      AI() &&
+      typeof AI().requestChatCompletion === 'function' &&
+      opts.apiConfig &&
+      (opts.apiConfig.url || opts.apiConfig.baseUrl) &&
+      (opts.apiConfig.key || opts.apiConfig.apiKey) &&
+      opts.apiConfig.model
+    );
+
+    if (opts.forceExtract) {
+      if (!hasUsableApi) {
+        throw new Error('模型或 API 未完整配置');
+      }
+      diag.modelRequested = true;
+      decision = await requestSemanticMemoryJudgment({
+        userText: userText,
+        assistantText: opts.assistantText || '',
+        historyMessages: opts.historyMessages || [],
+        userId: userId,
+        apiConfig: opts.apiConfig,
+        intentHint: 'save'
+      });
+    } else if (hasUsableApi) {
+      diag.modelRequested = true;
+      decision = await evaluateProactiveMemoryTurn({
+        userText: userText,
+        assistantText: opts.assistantText || '',
+        historyMessages: opts.historyMessages || [],
+        userId: userId,
+        apiConfig: opts.apiConfig
+      });
+    } else if (highCertaintyItems.length > 0) {
+      decision = {
+        intent: 'save',
+        shouldSave: true,
+        aboutUser: true,
+        isDurable: true,
+        factType: 'direct_fact',
+        confidence: 0.9,
+        items: highCertaintyItems
+      };
+      diag.candidateSource = 'high_certainty_rule';
+    } else {
+      throw new Error('API 未完整配置');
+    }
+
+    var llmItems = (decision && Array.isArray(decision.items)) ? decision.items.filter(function(it) {
+      return it && it.intent !== 'none' && it.action !== 'skip' && it.shouldSave !== false && String(it.content || '').trim();
+    }) : [];
+
+    if (llmItems.length > 0) {
+      diag.modelReturnedCandidates = true;
+      diag.candidateCount = llmItems.length;
+      if (diag.candidateSource === 'none') diag.candidateSource = 'llm';
+    }
+
+    var writeCtx = {
       userId: userId,
       chatId: opts.chatId || '',
       chatTitle: opts.chatTitle || '',
@@ -1525,11 +2581,110 @@
       rawUserText: userText,
       maxSingleMemoryLength: params.maxSingleMemoryLength,
       taskCreatedAt: opts.taskCreatedAt || Date.now(),
-      allowOverrideOlderTombstone: !!opts.allowOverrideOlderTombstone
-    });
+      allowOverrideOlderTombstone: !!opts.allowOverrideOlderTombstone,
+      isExplicit: !!opts.forceExtract
+    };
+
+    var applyRes = await applyStructuredSemanticDecision(decision, writeCtx);
+
+    // 若模型因过于保守或返回为空未保存，但本地高确定性规则明确识别到用户本人的长期偏好/项目/持续学习事实，则用高确定性提取结果补救保存
+    var totalChangedByLlm = (applyRes.added ? applyRes.added.length : 0) + (applyRes.updated ? applyRes.updated.length : 0);
+    if (
+      !opts.forceExtract &&
+      totalChangedByLlm === 0 &&
+      !applyRes.blockedSecrets &&
+      !applyRes.blockedDeleted &&
+      highCertaintyItems.length > 0 &&
+      !(decision && (decision.aboutUser === false || decision.factType === 'guess' || decision.factType === 'hypothesis' || decision.factType === 'quote'))
+    ) {
+      var ruleDecision = {
+        intent: 'save',
+        shouldSave: true,
+        aboutUser: true,
+        isDurable: true,
+        factType: 'direct_fact',
+        confidence: 0.9,
+        items: highCertaintyItems
+      };
+      var ruleApply = await applyStructuredSemanticDecision(ruleDecision, writeCtx);
+      var ruleChanged = (ruleApply.added ? ruleApply.added.length : 0) + (ruleApply.updated ? ruleApply.updated.length : 0);
+      if (ruleChanged > 0 || ruleApply.skipped > 0 || ruleApply.blockedDeleted > 0 || ruleApply.blockedSecrets > 0) {
+        applyRes = ruleApply;
+        diag.candidateSource = 'high_certainty_rule';
+        if (!diag.candidateCount) diag.candidateCount = highCertaintyItems.length;
+      }
+    }
+
+    var finalAdded = applyRes.added || [];
+    var finalUpdated = applyRes.updated || [];
+    var writtenIds = finalAdded.concat(finalUpdated).map(function(m) { return m && m.id; }).filter(Boolean);
+    var hasPassedCandidates = writtenIds.length > 0 || (applyRes.skipped > 0 && !applyRes.rejectedByValueGate && (diag.candidateCount > 0 || highCertaintyItems.length > 0));
+
+    diag.passedValueGate = hasPassedCandidates;
+    diag.dbWriteAttempted = writtenIds.length > 0;
+    diag.dbWriteSucceeded = writtenIds.length > 0;
+    diag.writtenCount = writtenIds.length;
+    diag.writtenMemoryIds = writtenIds;
+
+    if (writtenIds.length === 0) {
+      if (applyRes.blockedSecrets) {
+        diag.skipStage = 'privacy_guard';
+        diag.skipReason = '包含敏感或高风险隐私信息，已拦截';
+      } else if (applyRes.blockedDeleted) {
+        diag.skipStage = 'tombstone_guard';
+        diag.skipReason = '命中已删除记忆墓碑，防止旧任务复活';
+      } else if (applyRes.rejectedByValueGate) {
+        diag.skipStage = 'value_gate';
+        diag.skipReason = applyRes.valueRejectReason || '未达到长期记忆价值/置信度条件';
+      } else if (applyRes.skipped > 0) {
+        diag.skipStage = 'deduplicate';
+        diag.skipReason = '已有相同长期记忆，自动去重跳过';
+      } else {
+        diag.skipStage = 'model_none';
+        diag.skipReason = '模型判断本轮无值得长期保存的信息';
+      }
+    }
+
+    applyRes.diagnostics = diag;
+    return applyRes;
   }
 
-  // ===== 9. 持久化后台任务队列（自动提取 + 短期摘要，完整状态流转与真实写入追踪） =====
+  // ===== 9. 持久化后台任务队列（自动提取 + 短期摘要 + 7步诊断审计 + 失败自动重试） =====
+  function notifyMemoryQueueUpdated(summary) {
+    try {
+      if (typeof global.dispatchEvent === 'function' && typeof global.CustomEvent === 'function') {
+        global.dispatchEvent(new global.CustomEvent('aiw:memory-queue-updated', { detail: summary || {} }));
+      }
+    } catch (_) {}
+  }
+
+  function scheduleRetryTimer(apiConfig) {
+    if (_retryTimer) {
+      clearTimeout(_retryTimer);
+      _retryTimer = null;
+    }
+    var store = S();
+    if (!store || typeof store.listMemoryTasks !== 'function') return;
+    store.listMemoryTasks().then(function(tasks) {
+      var now = Date.now();
+      var soonest = 0;
+      for (var i = 0; i < tasks.length; i++) {
+        var t = tasks[i];
+        if (!t || t.status !== 'retry_waiting' || (t.attempts || 0) >= (t.maxAttempts || 3)) continue;
+        var due = Number(t.nextRetryAt) || (now + 5000);
+        if (!soonest || due < soonest) soonest = due;
+      }
+      if (!soonest) return;
+      var delay = Math.max(500, Math.min(60000, soonest - now + 200));
+      _retryTimer = setTimeout(function() {
+        _retryTimer = null;
+        processMemoryTaskQueue(apiConfig).then(function(res) {
+          notifyMemoryQueueUpdated(res);
+        }).catch(function() {});
+      }, delay);
+    }).catch(function() {});
+  }
+
   async function enqueueTurnMemoryTasks(options) {
     var opts = options && typeof options === 'object' ? options : {};
     var store = S();
@@ -1539,26 +2694,161 @@
     var params = resolveMemoryParams(settings);
     var queued = [];
 
-    if (params.useMemory && params.autoMemory && !opts.skipAutoMemory) {
+    if (!opts.skipAutoMemory) {
       var userText = String(opts.userText || '').trim();
-      var check = analyzeMemoryCandidate(userText);
-      if (check.shouldExtract && !check.blockedSecret) {
-        var extTask = await store.enqueueMemoryTask({
+      var turnKey = 'ext:' + String(opts.chatId || '') + ':' + String(opts.userMsgId || Date.now());
+      var compactHist = Array.isArray(opts.historyMessages)
+        ? opts.historyMessages.slice(-4).map(function(m) {
+            return { role: m.role, content: String(m.content || '').slice(0, 180) };
+          })
+        : [];
+
+      if (!params.useMemory || !params.autoMemory) {
+        var disabledReason = !params.useMemory ? '长期记忆已关闭' : '自动记忆已关闭';
+        var disabledTask = await store.enqueueMemoryTask({
           type: 'extract_memory',
-          turnKey: 'ext:' + String(opts.chatId || '') + ':' + String(opts.userMsgId || Date.now()),
+          turnKey: turnKey,
           chatId: opts.chatId || '',
           chatTitle: opts.chatTitle || '',
           projectId: opts.projectId || '',
           userId: opts.userId || 'local_user',
-          status: 'pending',
+          status: 'skipped',
+          attempts: 0,
           memoryWritten: false,
           savedMemoryIds: [],
-          payload: {
-            userText: userText.slice(0, 1500),
-            assistantText: String(opts.assistantText || '').slice(0, 700)
-          }
+          resultSummary: disabledReason + '，跳过自动提取',
+          diagnostics: {
+            enteredAutoJudgment: false,
+            skipStage: 'setting_disabled',
+            skipReason: disabledReason,
+            modelRequested: false,
+            modelReturnedCandidates: false,
+            candidateCount: 0,
+            passedValueGate: false,
+            candidateSource: 'none',
+            dbWriteAttempted: false,
+            dbWriteSucceeded: false,
+            writtenCount: 0,
+            writtenMemoryIds: []
+          },
+          payload: { userText: userText.slice(0, 300) }
         });
-        queued.push(extTask);
+        queued.push(disabledTask);
+      } else {
+        var check = analyzeMemoryCandidate(userText);
+        if (!check.shouldExtract || check.blockedSecret || check.blockedPrivacy) {
+          var filterSkipTask = await store.enqueueMemoryTask({
+            type: 'extract_memory',
+            turnKey: turnKey,
+            chatId: opts.chatId || '',
+            chatTitle: opts.chatTitle || '',
+            projectId: opts.projectId || '',
+            userId: opts.userId || 'local_user',
+            status: 'skipped',
+            attempts: 0,
+            memoryWritten: false,
+            savedMemoryIds: [],
+            resultSummary: check.label || '轻量筛选跳过，未写入记忆',
+            diagnostics: {
+              enteredAutoJudgment: true,
+              skipStage: (check.blockedSecret || check.blockedPrivacy) ? 'privacy_guard' : 'lightweight_filter',
+              skipReason: check.label || check.reason || '未命中提取条件',
+              modelRequested: false,
+              modelReturnedCandidates: false,
+              candidateCount: 0,
+              passedValueGate: false,
+              candidateSource: 'none',
+              dbWriteAttempted: false,
+              dbWriteSucceeded: false,
+              writtenCount: 0,
+              writtenMemoryIds: []
+            },
+            payload: { userText: (check.blockedSecret || check.blockedPrivacy) ? '[已脱敏]' : userText.slice(0, 300) }
+          });
+          queued.push(filterSkipTask);
+        } else {
+          var userId = opts.userId || 'local_user';
+          var thirdNorm = normalizeMemoryText(convertFirstPersonToThirdPerson(userText));
+          var existingMems = typeof store.listMemories === 'function' ? await store.listMemories({ userId: userId }) : [];
+          var alreadyInMem = existingMems.some(function(m) {
+            return m && normalizeMemoryText(m.content) === thirdNorm;
+          });
+
+          var recentTasks = typeof store.listMemoryTasks === 'function' ? await store.listMemoryTasks() : [];
+          var rawNorm = normalizeMemoryText(userText);
+          var nowTs = Date.now();
+          var dupRecent = recentTasks.slice(0, 12).some(function(t) {
+            if (!t || t.chatId !== (opts.chatId || '') || !t.payload) return false;
+            if (normalizeMemoryText(t.payload.userText) !== rawNorm) return false;
+            if (t.status === 'pending' || t.status === 'running') return true;
+            if (t.status === 'saved' && (alreadyInMem || (nowTs - (t.createdAt || 0)) < 30000)) return true;
+            return false;
+          });
+
+          if (alreadyInMem || dupRecent) {
+            var dupTask = await store.enqueueMemoryTask({
+              type: 'extract_memory',
+              turnKey: turnKey,
+              chatId: opts.chatId || '',
+              chatTitle: opts.chatTitle || '',
+              projectId: opts.projectId || '',
+              userId: userId,
+              status: 'skipped',
+              attempts: 0,
+              memoryWritten: false,
+              savedMemoryIds: [],
+              resultSummary: '长期记忆中已存在相同内容，自动去重跳过',
+              diagnostics: {
+                enteredAutoJudgment: true,
+                skipStage: 'deduplicate',
+                skipReason: alreadyInMem ? '记忆库已存在相同内容' : '同会话短时间内已处理相同内容',
+                modelRequested: false,
+                modelReturnedCandidates: false,
+                candidateCount: 0,
+                passedValueGate: false,
+                candidateSource: 'none',
+                dbWriteAttempted: false,
+                dbWriteSucceeded: false,
+                writtenCount: 0,
+                writtenMemoryIds: []
+              },
+              payload: { userText: userText.slice(0, 300) }
+            });
+            queued.push(dupTask);
+          } else {
+            var extTask = await store.enqueueMemoryTask({
+              type: 'extract_memory',
+              turnKey: turnKey,
+              chatId: opts.chatId || '',
+              chatTitle: opts.chatTitle || '',
+              projectId: opts.projectId || '',
+              userId: userId,
+              status: 'pending',
+              memoryWritten: false,
+              savedMemoryIds: [],
+              diagnostics: {
+                enteredAutoJudgment: true,
+                skipStage: '',
+                skipReason: '',
+                modelRequested: false,
+                modelReturnedCandidates: false,
+                candidateCount: 0,
+                passedValueGate: false,
+                candidateSource: 'none',
+                dbWriteAttempted: false,
+                dbWriteSucceeded: false,
+                writtenCount: 0,
+                writtenMemoryIds: []
+              },
+              payload: {
+                userText: userText.slice(0, 1500),
+                assistantText: String(opts.assistantText || '').slice(0, 700),
+                historyMessages: compactHist
+              }
+            });
+            queued.push(extTask);
+          }
+        }
       }
     }
 
@@ -1588,19 +2878,21 @@
   async function processMemoryTaskQueue(apiConfig, options) {
     var store = S();
     if (!store || typeof store.listMemoryTasks !== 'function') {
-      return { addedCount: 0, updatedCount: 0, summarizedChats: [], failedTasks: [], processed: 0 };
+      return { addedCount: 0, updatedCount: 0, deletedCount: 0, summarizedChats: [], failedTasks: [], processed: 0 };
     }
     if (_queueRunning) {
       _queueRerunRequested = true;
-      return { busy: true, addedCount: 0, updatedCount: 0, summarizedChats: [], failedTasks: [], processed: 0 };
+      return { busy: true, addedCount: 0, updatedCount: 0, deletedCount: 0, summarizedChats: [], failedTasks: [], processed: 0 };
     }
 
     _queueRunning = true;
     var addedCount = 0;
     var updatedCount = 0;
+    var deletedCount = 0;
     var summarizedChats = [];
     var failedTasks = [];
     var processed = 0;
+    var hasRetryWaiting = false;
     var opts = options && typeof options === 'object' ? options : {};
 
     try {
@@ -1626,11 +2918,12 @@
         await store.updateMemoryTask(task.id, { status: 'running' });
 
         try {
-          if (task.type === 'extract_memory' || task.type === 'explicit_memory') {
-            var isExplicitTask = task.type === 'explicit_memory';
+          if (task.type === 'extract_memory' || task.type === 'explicit_memory' || task.type === 'explicit_update') {
+            var isExplicitTask = task.type === 'explicit_memory' || task.type === 'explicit_update';
             var res = await extractAndSaveFromTurn({
               userText: task.payload && task.payload.userText,
               assistantText: task.payload && task.payload.assistantText,
+              historyMessages: (task.payload && task.payload.historyMessages) || [],
               chatId: task.chatId,
               chatTitle: task.chatTitle,
               projectId: task.projectId,
@@ -1639,33 +2932,44 @@
               forceExtract: isExplicitTask,
               ignoreAutoMemoryToggle: isExplicitTask,
               taskCreatedAt: task.createdAt || Date.now(),
-              allowOverrideOlderTombstone: false
+              allowOverrideOlderTombstone: true
             });
             var addedList = (res && res.added) || [];
             var updatedList = (res && res.updated) || [];
+            var deletedList = (res && res.deleted) || [];
             var savedIds = addedList.concat(updatedList).map(function(m) { return m && m.id; }).filter(Boolean);
             var aLen = addedList.length;
             var uLen = updatedList.length;
+            var dLen = deletedList.length;
+            var diagData = (res && res.diagnostics) || null;
             addedCount += aLen;
             updatedCount += uLen;
+            deletedCount += dLen;
             processed++;
 
-            if (aLen > 0 || uLen > 0) {
+            if (aLen > 0 || uLen > 0 || dLen > 0) {
+              var msgParts = [];
+              if (aLen > 0) msgParts.push('新增 ' + aLen + ' 条');
+              if (uLen > 0) msgParts.push('更新 ' + uLen + ' 条');
+              if (dLen > 0) msgParts.push('删除 ' + dLen + ' 条');
+              if (diagData && diagData.candidateSource === 'high_certainty_rule') {
+                msgParts.push('高确定性提取');
+              }
               await store.updateMemoryTask(task.id, {
                 status: 'saved',
                 attempts: (task.attempts || 0) + 1,
-                memoryWritten: true,
+                memoryWritten: (aLen + uLen) > 0,
                 savedMemoryIds: savedIds,
                 lastError: '',
-                resultSummary: '新增 ' + aLen + ' 条，更新 ' + uLen + ' 条'
+                diagnostics: diagData,
+                resultSummary: msgParts.join(' · ')
               });
             } else {
-              var skipReason = '未提取到可保存信息';
+              var skipReason = (diagData && diagData.skipReason) || '未提取到可保存信息';
               if (res && res.disabledReason === 'useMemory_off') skipReason = '长期记忆已关闭';
               else if (res && res.disabledReason === 'autoMemory_off') skipReason = '自动记忆已关闭';
-              else if (res && res.blockedSecrets) skipReason = '含敏感信息，已安全拦截';
+              else if (res && res.blockedSecrets) skipReason = '含敏感或隐私信息，已安全拦截';
               else if (res && res.blockedDeleted) skipReason = '已删除记忆墓碑拦截，未重新恢复';
-              else if (res && res.skipped) skipReason = '与已有记忆重复，已跳过';
 
               await store.updateMemoryTask(task.id, {
                 status: 'skipped',
@@ -1673,6 +2977,7 @@
                 memoryWritten: false,
                 savedMemoryIds: [],
                 lastError: '',
+                diagnostics: diagData,
                 resultSummary: skipReason
               });
             }
@@ -1710,13 +3015,23 @@
           var nextAttempts = (task.attempts || 0) + 1;
           var maxAttempts = task.maxAttempts || 3;
           var willRetry = nextAttempts < maxAttempts;
-          var backoffMs = nextAttempts === 1 ? 5000 : (nextAttempts === 2 ? 15000 : 45000);
+          if (willRetry) hasRetryWaiting = true;
+          var backoffMs = nextAttempts === 1 ? 4500 : (nextAttempts === 2 ? 12000 : 30000);
           var errMsg = sanitizeErrorForLog(err);
+          var failDiag = Object.assign({}, task.diagnostics || {}, {
+            enteredAutoJudgment: true,
+            modelRequested: true,
+            dbWriteAttempted: false,
+            dbWriteSucceeded: false,
+            skipStage: 'api_error',
+            skipReason: errMsg
+          });
           var failedTask = await store.updateMemoryTask(task.id, {
             status: willRetry ? 'retry_waiting' : 'failed',
             attempts: nextAttempts,
             memoryWritten: false,
             lastError: errMsg,
+            diagnostics: failDiag,
             nextRetryAt: willRetry ? (Date.now() + backoffMs) : 0
           });
           failedTasks.push(failedTask || task);
@@ -1727,11 +3042,16 @@
       _queueRunning = false;
     }
 
+    if (hasRetryWaiting && !opts.disableRetryTimer) {
+      scheduleRetryTimer(apiConfig);
+    }
+
     if (_queueRerunRequested) {
       _queueRerunRequested = false;
       var follow = await processMemoryTaskQueue(apiConfig, options);
       addedCount += follow.addedCount || 0;
       updatedCount += follow.updatedCount || 0;
+      deletedCount += follow.deletedCount || 0;
       processed += follow.processed || 0;
       if (Array.isArray(follow.summarizedChats)) summarizedChats = summarizedChats.concat(follow.summarizedChats);
       if (Array.isArray(follow.failedTasks)) failedTasks = failedTasks.concat(follow.failedTasks);
@@ -1740,6 +3060,7 @@
     return {
       addedCount: addedCount,
       updatedCount: updatedCount,
+      deletedCount: deletedCount,
       summarizedChats: summarizedChats,
       failedTasks: failedTasks,
       processed: processed
@@ -1749,7 +3070,7 @@
   async function retryFailedMemoryTasks(apiConfig) {
     var store = S();
     if (!store || typeof store.listMemoryTasks !== 'function') {
-      return { addedCount: 0, updatedCount: 0, summarizedChats: [], failedTasks: [], processed: 0 };
+      return { addedCount: 0, updatedCount: 0, deletedCount: 0, summarizedChats: [], failedTasks: [], processed: 0 };
     }
     var tasks = await store.listMemoryTasks();
     for (var i = 0; i < tasks.length; i++) {
@@ -1769,6 +3090,7 @@
     SHORT_TERM_RECENT_RAW: DEFAULT_RECENT_RAW,
     resolveMemoryParams: resolveMemoryParams,
     containsSensitiveSecret: containsSensitiveSecret,
+    containsHighRiskPrivacy: containsHighRiskPrivacy,
     normalizeMemoryText: normalizeMemoryText,
     computeTextSimilarity: computeTextSimilarity,
     filterAccessibleMemories: filterAccessibleMemories,
@@ -1776,13 +3098,20 @@
     retrieveWorkspaceContext: retrieveWorkspaceContext,
     needsShortTermSummary: needsShortTermSummary,
     summarizeChatSegment: summarizeChatSegment,
+    detectMemoryIntentFast: detectMemoryIntentFast,
     detectExplicitMemoryCommand: detectExplicitMemoryCommand,
+    looksLikeSoftMemoryIntent: looksLikeSoftMemoryIntent,
     parseDirectExplicitMemoryFact: parseDirectExplicitMemoryFact,
+    stripDeleteCommandTarget: stripDeleteCommandTarget,
     handleExplicitMemoryCommand: handleExplicitMemoryCommand,
+    isGuessHypothesisOrThirdPartyQuote: isGuessHypothesisOrThirdPartyQuote,
+    extractHighCertaintyFactCandidates: extractHighCertaintyFactCandidates,
     analyzeMemoryCandidate: analyzeMemoryCandidate,
     shouldAttemptExtraction: shouldAttemptExtraction,
     upsertExtractedMemories: upsertExtractedMemories,
+    parseStructuredMemoryResponse: parseStructuredMemoryResponse,
     parseExtractorJson: parseExtractorJson,
+    evaluateProactiveMemoryTurn: evaluateProactiveMemoryTurn,
     extractAndSaveFromTurn: extractAndSaveFromTurn,
     enqueueTurnMemoryTasks: enqueueTurnMemoryTasks,
     processMemoryTaskQueue: processMemoryTaskQueue,

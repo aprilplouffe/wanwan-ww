@@ -417,6 +417,14 @@
       );
     }
 
+    // 记忆系统真实执行状态提醒（如：需要向用户追问澄清、已拦截或关闭时，禁止假装“已记住/已删除”）
+    if (opts.memoryTurnNotice && String(opts.memoryTurnNotice).trim()) {
+      sections.push(
+        '【本轮记忆系统真实状态提醒】\n' +
+        String(opts.memoryTurnNotice).trim()
+      );
+    }
+
     return sections.join('\n\n');
   }
 

@@ -1152,6 +1152,7 @@
       savedMemoryIds: savedIds,
       lastError: sanitizeTaskErrorText(src.lastError),
       resultSummary: String(src.resultSummary || '').slice(0, 200),
+      diagnostics: src.diagnostics && typeof src.diagnostics === 'object' ? deepClone(src.diagnostics) : null,
       createdAt: Number(src.createdAt) || Date.now(),
       updatedAt: Number(src.updatedAt) || Date.now(),
       nextRetryAt: Number(src.nextRetryAt) || 0
@@ -1197,6 +1198,7 @@
       savedMemoryIds: Array.isArray(src.savedMemoryIds) ? src.savedMemoryIds : [],
       lastError: src.lastError || '',
       resultSummary: src.resultSummary || '',
+      diagnostics: src.diagnostics && typeof src.diagnostics === 'object' ? src.diagnostics : null,
       createdAt: src.createdAt || now,
       updatedAt: src.updatedAt || now,
       nextRetryAt: src.nextRetryAt || 0
@@ -1215,6 +1217,9 @@
       id: tasks[idx].id,
       updatedAt: Date.now()
     });
+    if (patch && patch.diagnostics && typeof patch.diagnostics === 'object') {
+      merged.diagnostics = Object.assign({}, tasks[idx].diagnostics || {}, patch.diagnostics);
+    }
     if (patch && patch.lastError !== undefined) {
       merged.lastError = sanitizeTaskErrorText(patch.lastError);
     }
