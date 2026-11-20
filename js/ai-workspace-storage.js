@@ -17,8 +17,67 @@
     API_CONFIG: 'aiw_api_config',
     SELECTED_MODEL: 'aiw_selected_model',
     CHAT_IDS: 'aiw_chat_ids',
-    CHAT_PREFIX: 'aiw_chat:'
+    CHAT_PREFIX: 'aiw_chat:',
+    MEMORY_SETTINGS: 'aiw_memory_settings',
+    MEMORY_IDS: 'aiw_memory_ids',
+    MEMORY_PREFIX: 'aiw_memory:',
+    MEMORY_TASKS: 'aiw_memory_tasks',
+    DELETED_MEMORY_SIGS: 'aiw_deleted_memory_sigs'
   };
+
+  var MEMORY_STRATEGY_PRESETS = {
+    natural: {
+      id: 'natural',
+      label: '自然 · 推荐',
+      summary: '兼顾上下文连贯与开销控制，适合日常绝大多数对话',
+      summaryTriggerChars: 3200,
+      recentRawMessagesLimit: 6,
+      maxMemoryRecallCount: 5,
+      maxSingleMemoryLength: 260
+    },
+    token_saver: {
+      id: 'token_saver',
+      label: '省 Token',
+      summary: '更早触发阶段摘要并精简近期原文与记忆召回条数，减少上下文占用',
+      summaryTriggerChars: 1400,
+      recentRawMessagesLimit: 4,
+      maxMemoryRecallCount: 2,
+      maxSingleMemoryLength: 140
+    },
+    recall_more: {
+      id: 'recall_more',
+      label: '记得更多',
+      summary: '保留更多近期原始消息与历史记忆召回条数，适合复杂长程协作',
+      summaryTriggerChars: 5600,
+      recentRawMessagesLimit: 12,
+      maxMemoryRecallCount: 8,
+      maxSingleMemoryLength: 380
+    }
+  };
+
+  var MEMORY_SETTING_BOUNDS = {
+    summaryTriggerChars: { min: 400, max: 12000, def: 3200 },
+    recentRawMessagesLimit: { min: 2, max: 24, def: 6 },
+    maxMemoryRecallCount: { min: 1, max: 12, def: 5 },
+    maxSingleMemoryLength: { min: 60, max: 500, def: 260 }
+  };
+
+  var DEFAULT_MEMORY_SETTINGS = {
+    shortTermContext: true,
+    crossChatMemory: true,
+    useMemory: true,
+    autoMemory: true,
+    referenceHistoryChats: true,
+    strategy: 'natural',
+    summaryTriggerChars: 3200,
+    recentRawMessagesLimit: 6,
+    maxMemoryRecallCount: 5,
+    maxSingleMemoryLength: 260,
+    updatedAt: 0
+  };
+
+  var MEMORY_CATEGORIES = ['偏好', '习惯', '长期计划', '项目', '决定', '备忘', '身份信息'];
+  var MEMORY_SCOPES = ['user', 'chat', 'project'];
 
   var ACCENT_PRESETS = [
     { id: 'pink', label: '粉色', color: '#ec4899' },
@@ -688,7 +747,12 @@
       updatedAt: Number(src.updatedAt) || now,
       model: String(src.model || '').trim(),
       presetId: String(src.presetId || '').trim(),
-      presetSnapshot: src.presetSnapshot ? buildPresetSnapshot(src.presetSnapshot) : null
+      presetSnapshot: src.presetSnapshot ? buildPresetSnapshot(src.presetSnapshot) : null,
+      projectId: String(src.projectId || '').trim(),
+      summary: String(src.summary || '').trim(),
+      summaryUpToCount: Math.max(0, Number(src.summaryUpToCount) || 0),
+      summaryUpdatedAt: Number(src.summaryUpdatedAt) || 0,
+      lastMemoryMessageId: String(src.lastMemoryMessageId || '').trim()
     };
   }
 
@@ -796,9 +860,455 @@
     });
   }
 
+  // ===== 10. 独立长期记忆存储（aiw_memory_ids / aiw_memory:<id>，绝不混入 db.memories） =====
+  function generateMemoryId() {
+    return 'mem_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7);
+  }
+
+  function normalizeMemoryCategory(cat) {
+    var val = String(cat || '').trim();
+    if (MEMORY_CATEGORIES.indexOf(val) !== -1) return val;
+    if (/偏好|喜好|口味|风格/.test(val)) return '偏好';
+    if (/习惯|作息|日常/.test(val)) return '习惯';
+    if (/计划|目标|规划/.test(val)) return '长期计划';
+    if (/项目|工作|开发|任务/.test(val)) return '项目';
+    if (/决定|选择|约定/.test(val)) return '决定';
+    if (/身份|职业|背景|个人/.test(val)) return '身份信息';
+    return '备忘';
+  }
+
+  function normalizeMemoryScope(scope) {
+    var val = String(scope || '').trim().toLowerCase();
+    return MEMORY_SCOPES.indexOf(val) !== -1 ? val : 'user';
+  }
+
+  function normalizeImportance(val) {
+    var n = Math.round(Number(val));
+    if (!Number.isFinite(n)) return 3;
+    return Math.max(1, Math.min(5, n));
+  }
+
+  function normalizeTemporalState(val, statusHint) {
+    var v = String(val || '').trim().toLowerCase();
+    if (['current', 'past', 'future_plan', 'completed', 'cancelled'].indexOf(v) !== -1) return v;
+    var st = String(statusHint || '').trim().toLowerCase();
+    if (st === 'historical') return 'past';
+    if (st === 'completed') return 'completed';
+    if (st === 'cancelled') return 'cancelled';
+    return 'current';
+  }
+
+  function normalizeMemoryStatus(val, temporalState) {
+    var v = String(val || '').trim().toLowerCase();
+    if (['active', 'historical', 'completed', 'cancelled'].indexOf(v) !== -1) return v;
+    if (temporalState === 'past') return 'historical';
+    if (temporalState === 'completed') return 'completed';
+    if (temporalState === 'cancelled') return 'cancelled';
+    return 'active';
+  }
+
+  function normalizeConfidenceValue(val) {
+    if (val === undefined || val === null || val === '') return 0.85;
+    var n = Number(val);
+    if (!Number.isFinite(n)) return 0.85;
+    if (n > 1 && n <= 100) n = n / 100;
+    return Math.round(Math.max(0, Math.min(1, n)) * 100) / 100;
+  }
+
+  function normalizeMemoryRecord(raw, forcedId) {
+    var now = Date.now();
+    var src = raw && typeof raw === 'object' ? raw : {};
+    var temporalState = normalizeTemporalState(src.temporalState, src.status);
+    var status = normalizeMemoryStatus(src.status, temporalState);
+    var historyList = Array.isArray(src.history) ? src.history.slice(0, 3).map(function(h) {
+      if (!h || typeof h !== 'object') return null;
+      var hc = String(h.content || '').trim();
+      if (!hc) return null;
+      return {
+        content: hc.slice(0, 260),
+        updatedAt: Number(h.updatedAt) || now,
+        temporalState: normalizeTemporalState(h.temporalState, h.status),
+        status: normalizeMemoryStatus(h.status, h.temporalState)
+      };
+    }).filter(Boolean) : [];
+
+    return {
+      id: String(forcedId || src.id || generateMemoryId()),
+      content: String(src.content || '').trim(),
+      category: normalizeMemoryCategory(src.category),
+      createdAt: Number(src.createdAt) || now,
+      updatedAt: Number(src.updatedAt) || now,
+      sourceChatId: String(src.sourceChatId || '').trim(),
+      sourceChatTitle: String(src.sourceChatTitle || '').trim(),
+      importance: normalizeImportance(src.importance),
+      scope: normalizeMemoryScope(src.scope),
+      userId: String(src.userId || 'local_user').trim() || 'local_user',
+      projectId: String(src.projectId || '').trim(),
+      confidence: normalizeConfidenceValue(src.confidence),
+      temporalState: temporalState,
+      status: status,
+      factSource: String(src.factSource || 'user_statement').trim() || 'user_statement',
+      relation: String(src.relation || 'new').trim() || 'new',
+      supersedesId: String(src.supersedesId || '').trim(),
+      previousContent: String(src.previousContent || '').trim().slice(0, 260),
+      history: historyList
+    };
+  }
+
+  function clampMemoryNumericSetting(key, rawVal, fallbackVal) {
+    var spec = MEMORY_SETTING_BOUNDS[key];
+    if (!spec) return Number(rawVal) || 0;
+    var n = Math.round(Number(rawVal));
+    if (!Number.isFinite(n)) {
+      return typeof fallbackVal === 'number' && Number.isFinite(fallbackVal) ? fallbackVal : spec.def;
+    }
+    if (n < spec.min) return spec.min;
+    if (n > spec.max) return spec.max;
+    return n;
+  }
+
+  function sanitizeMemorySettings(raw, base) {
+    var src = raw && typeof raw === 'object' ? raw : {};
+    var prev = base && typeof base === 'object' ? base : DEFAULT_MEMORY_SETTINGS;
+    var strategy = src.strategy != null ? String(src.strategy) : String(prev.strategy || 'natural');
+    if (!MEMORY_STRATEGY_PRESETS[strategy]) strategy = 'natural';
+
+    return {
+      shortTermContext: typeof src.shortTermContext === 'boolean' ? src.shortTermContext : (prev.shortTermContext !== false),
+      crossChatMemory: typeof src.crossChatMemory === 'boolean' ? src.crossChatMemory : (prev.crossChatMemory !== false),
+      useMemory: typeof src.useMemory === 'boolean' ? src.useMemory : (prev.useMemory !== false),
+      autoMemory: typeof src.autoMemory === 'boolean' ? src.autoMemory : (prev.autoMemory !== false),
+      referenceHistoryChats: typeof src.referenceHistoryChats === 'boolean' ? src.referenceHistoryChats : (prev.referenceHistoryChats !== false),
+      strategy: strategy,
+      summaryTriggerChars: clampMemoryNumericSetting('summaryTriggerChars', src.summaryTriggerChars, prev.summaryTriggerChars),
+      recentRawMessagesLimit: clampMemoryNumericSetting('recentRawMessagesLimit', src.recentRawMessagesLimit, prev.recentRawMessagesLimit),
+      maxMemoryRecallCount: clampMemoryNumericSetting('maxMemoryRecallCount', src.maxMemoryRecallCount, prev.maxMemoryRecallCount),
+      maxSingleMemoryLength: clampMemoryNumericSetting('maxSingleMemoryLength', src.maxSingleMemoryLength, prev.maxSingleMemoryLength),
+      updatedAt: Number(src.updatedAt) || Number(prev.updatedAt) || 0
+    };
+  }
+
+  async function getMemorySettings() {
+    var saved = await dbGetConfig(KEYS.MEMORY_SETTINGS);
+    return sanitizeMemorySettings(saved, DEFAULT_MEMORY_SETTINGS);
+  }
+
+  async function saveMemorySettings(patch) {
+    var current = await getMemorySettings();
+    var p = patch && typeof patch === 'object' ? patch : {};
+    var nextInput = Object.assign({}, current, p, { updatedAt: Date.now() });
+    if (p.strategy && MEMORY_STRATEGY_PRESETS[p.strategy] && p.applyStrategyPreset !== false) {
+      var preset = MEMORY_STRATEGY_PRESETS[p.strategy];
+      if (p.summaryTriggerChars === undefined) nextInput.summaryTriggerChars = preset.summaryTriggerChars;
+      if (p.recentRawMessagesLimit === undefined) nextInput.recentRawMessagesLimit = preset.recentRawMessagesLimit;
+      if (p.maxMemoryRecallCount === undefined) nextInput.maxMemoryRecallCount = preset.maxMemoryRecallCount;
+      if (p.maxSingleMemoryLength === undefined) nextInput.maxSingleMemoryLength = preset.maxSingleMemoryLength;
+    }
+    var next = sanitizeMemorySettings(nextInput, current);
+    next.updatedAt = Date.now();
+    return await dbPutConfig(KEYS.MEMORY_SETTINGS, next);
+  }
+
+  async function applyMemoryStrategy(strategyId) {
+    var preset = MEMORY_STRATEGY_PRESETS[strategyId] || MEMORY_STRATEGY_PRESETS.natural;
+    return await saveMemorySettings({
+      strategy: preset.id,
+      summaryTriggerChars: preset.summaryTriggerChars,
+      recentRawMessagesLimit: preset.recentRawMessagesLimit,
+      maxMemoryRecallCount: preset.maxMemoryRecallCount,
+      maxSingleMemoryLength: preset.maxSingleMemoryLength
+    });
+  }
+
+  async function resetMemorySettingsToDefaults() {
+    var next = Object.assign({}, DEFAULT_MEMORY_SETTINGS, { updatedAt: Date.now() });
+    return await dbPutConfig(KEYS.MEMORY_SETTINGS, next);
+  }
+
+  async function listMemories(options) {
+    var opts = options && typeof options === 'object' ? options : {};
+    var ids = await dbGetConfig(KEYS.MEMORY_IDS);
+    if (!Array.isArray(ids)) ids = [];
+    var items = [];
+    for (var i = 0; i < ids.length; i++) {
+      var id = ids[i];
+      var raw = await dbGetConfig(KEYS.MEMORY_PREFIX + id);
+      if (raw && typeof raw === 'object') {
+        var norm = normalizeMemoryRecord(raw, id);
+        if (norm.content) {
+          if (opts.userId && norm.userId !== opts.userId) continue;
+          if (opts.scope && norm.scope !== opts.scope) continue;
+          items.push(norm);
+        }
+      }
+    }
+    items.sort(function(a, b) {
+      return (b.updatedAt || b.createdAt || 0) - (a.updatedAt || a.createdAt || 0);
+    });
+    return items;
+  }
+
+  async function getMemory(id) {
+    if (!id) return null;
+    var raw = await dbGetConfig(KEYS.MEMORY_PREFIX + id);
+    if (!raw || typeof raw !== 'object') return null;
+    return normalizeMemoryRecord(raw, id);
+  }
+
+  async function createMemory(data) {
+    var ids = await dbGetConfig(KEYS.MEMORY_IDS);
+    if (!Array.isArray(ids)) ids = [];
+    var now = Date.now();
+    var src = data && typeof data === 'object' ? data : {};
+    var mem = normalizeMemoryRecord(Object.assign({}, src, {
+      id: src.id || generateMemoryId(),
+      createdAt: now,
+      updatedAt: now
+    }));
+    if (!mem.content) return null;
+
+    await dbPutConfig(KEYS.MEMORY_PREFIX + mem.id, mem);
+    if (ids.indexOf(mem.id) === -1) {
+      ids.unshift(mem.id);
+      await dbPutConfig(KEYS.MEMORY_IDS, ids);
+    }
+    return mem;
+  }
+
+  async function updateMemory(id, patch) {
+    if (!id) return null;
+    var existing = await getMemory(id);
+    if (!existing) return null;
+    var p = patch && typeof patch === 'object' ? patch : {};
+    var nextHistory = Array.isArray(p.history) ? p.history.slice(0, 3) : (Array.isArray(existing.history) ? existing.history.slice(0, 3) : []);
+    var prevContent = existing.previousContent || '';
+    if (p.content && String(p.content).trim() !== existing.content) {
+      prevContent = existing.content;
+      nextHistory.unshift({
+        content: existing.content,
+        updatedAt: existing.updatedAt || existing.createdAt,
+        temporalState: existing.temporalState || 'current',
+        status: existing.status || 'active'
+      });
+      nextHistory = nextHistory.slice(0, 3);
+    }
+    var next = normalizeMemoryRecord(Object.assign({}, existing, p, {
+      id: existing.id,
+      createdAt: existing.createdAt,
+      updatedAt: Date.now(),
+      previousContent: p.previousContent != null ? p.previousContent : prevContent,
+      history: nextHistory
+    }), existing.id);
+    if (!next.content) return null;
+    await dbPutConfig(KEYS.MEMORY_PREFIX + existing.id, next);
+    return next;
+  }
+
+  function normalizeDeletedSignatureText(text) {
+    return String(text || '')
+      .toLowerCase()
+      .replace(/^[-*•\d.)\s]+/, '')
+      .replace(/[\s，。！？、；：“”"'‘’（）()【】\[\],.!?;:~`「」]+/g, '')
+      .trim();
+  }
+
+  async function listDeletedMemorySignatures() {
+    var list = await dbGetConfig(KEYS.DELETED_MEMORY_SIGS);
+    return Array.isArray(list) ? list : [];
+  }
+
+  async function addDeletedMemorySignature(mem) {
+    if (!mem || !mem.content) return [];
+    var norm = normalizeDeletedSignatureText(mem.content);
+    if (!norm) return await listDeletedMemorySignatures();
+    var list = await listDeletedMemorySignatures();
+    var filtered = list.filter(function(item) { return item && item.norm !== norm; });
+    filtered.unshift({
+      norm: norm,
+      content: String(mem.content || '').slice(0, 120),
+      sourceChatId: String(mem.sourceChatId || ''),
+      deletedAt: Date.now()
+    });
+    if (filtered.length > 100) filtered = filtered.slice(0, 100);
+    return await dbPutConfig(KEYS.DELETED_MEMORY_SIGS, filtered);
+  }
+
+  async function removeDeletedMemorySignatureByContent(content) {
+    var norm = normalizeDeletedSignatureText(content);
+    if (!norm) return;
+    var list = await listDeletedMemorySignatures();
+    var next = list.filter(function(item) { return item && item.norm !== norm; });
+    if (next.length !== list.length) {
+      await dbPutConfig(KEYS.DELETED_MEMORY_SIGS, next);
+    }
+  }
+
+  async function deleteMemory(id) {
+    if (!id) return false;
+    var existing = await getMemory(id);
+    if (existing) {
+      await addDeletedMemorySignature(existing);
+    }
+    var ids = await dbGetConfig(KEYS.MEMORY_IDS);
+    if (!Array.isArray(ids)) ids = [];
+    var idx = ids.indexOf(id);
+    if (idx !== -1) {
+      ids.splice(idx, 1);
+      await dbPutConfig(KEYS.MEMORY_IDS, ids);
+    }
+    await dbDeleteConfig(KEYS.MEMORY_PREFIX + id);
+    return true;
+  }
+
+  async function clearAllMemories() {
+    var existingList = await listMemories();
+    for (var k = 0; k < existingList.length; k++) {
+      await addDeletedMemorySignature(existingList[k]);
+    }
+    var ids = await dbGetConfig(KEYS.MEMORY_IDS);
+    if (!Array.isArray(ids)) ids = [];
+    for (var i = 0; i < ids.length; i++) {
+      await dbDeleteConfig(KEYS.MEMORY_PREFIX + ids[i]);
+    }
+    await dbPutConfig(KEYS.MEMORY_IDS, []);
+    return true;
+  }
+
+  // ===== 11. 持久化记忆与摘要任务队列（防止切换聊天/刷新丢失，支持失败记录与重试） =====
+  function generateTaskId() {
+    return 'memtask_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7);
+  }
+
+  function sanitizeTaskErrorText(rawErr) {
+    var s = String(rawErr || '').trim();
+    if (!s) return '';
+    return s
+      .replace(/\bsk-(?:proj-|live-|test-)?[A-Za-z0-9_-]{8,}\b/gi, 'sk-***')
+      .replace(/\bBearer\s+[A-Za-z0-9._-]{8,}\b/gi, 'Bearer ***')
+      .replace(/\bAIza[0-9A-Za-z_-]{10,}\b/g, 'AIza***')
+      .slice(0, 220);
+  }
+
+  function normalizeMemoryTaskRecord(raw) {
+    var src = raw && typeof raw === 'object' ? raw : {};
+    var status = String(src.status || 'pending');
+    if (status === 'done') {
+      status = src.memoryWritten ? 'saved' : 'skipped';
+    }
+    if (['pending', 'running', 'saved', 'skipped', 'failed', 'retry_waiting'].indexOf(status) === -1) {
+      status = 'pending';
+    }
+    var savedIds = Array.isArray(src.savedMemoryIds) ? src.savedMemoryIds.filter(Boolean).map(String) : [];
+    return {
+      id: String(src.id || generateTaskId()),
+      type: String(src.type || 'extract_memory'),
+      turnKey: String(src.turnKey || '').trim(),
+      chatId: String(src.chatId || ''),
+      chatTitle: String(src.chatTitle || ''),
+      projectId: String(src.projectId || ''),
+      userId: String(src.userId || 'local_user'),
+      payload: src.payload && typeof src.payload === 'object' ? src.payload : {},
+      status: status,
+      attempts: Math.max(0, Number(src.attempts) || 0),
+      maxAttempts: Math.max(1, Number(src.maxAttempts) || 3),
+      memoryWritten: typeof src.memoryWritten === 'boolean' ? src.memoryWritten : (savedIds.length > 0),
+      savedMemoryIds: savedIds,
+      lastError: sanitizeTaskErrorText(src.lastError),
+      resultSummary: String(src.resultSummary || '').slice(0, 200),
+      diagnostics: src.diagnostics && typeof src.diagnostics === 'object' ? deepClone(src.diagnostics) : null,
+      createdAt: Number(src.createdAt) || Date.now(),
+      updatedAt: Number(src.updatedAt) || Date.now(),
+      nextRetryAt: Number(src.nextRetryAt) || 0
+    };
+  }
+
+  async function listMemoryTasks() {
+    var tasks = await dbGetConfig(KEYS.MEMORY_TASKS);
+    return Array.isArray(tasks) ? tasks.map(normalizeMemoryTaskRecord) : [];
+  }
+
+  async function saveMemoryTasks(tasks) {
+    var arr = Array.isArray(tasks) ? tasks.slice(0, 40).map(normalizeMemoryTaskRecord) : [];
+    return await dbPutConfig(KEYS.MEMORY_TASKS, arr);
+  }
+
+  async function enqueueMemoryTask(taskData) {
+    var src = taskData && typeof taskData === 'object' ? taskData : {};
+    var tasks = await listMemoryTasks();
+    var turnKey = String(src.turnKey || '').trim();
+    if (turnKey) {
+      var dup = tasks.find(function(t) {
+        return t && t.turnKey === turnKey && (
+          t.status === 'pending' || t.status === 'running' || t.status === 'saved' || t.status === 'skipped'
+        );
+      });
+      if (dup) return dup;
+    }
+    var now = Date.now();
+    var task = normalizeMemoryTaskRecord({
+      id: src.id || generateTaskId(),
+      type: src.type || 'extract_memory',
+      turnKey: turnKey,
+      chatId: src.chatId || '',
+      chatTitle: src.chatTitle || '',
+      projectId: src.projectId || '',
+      userId: src.userId || 'local_user',
+      payload: src.payload || {},
+      status: src.status || 'pending',
+      attempts: src.attempts || 0,
+      maxAttempts: Math.max(1, Number(src.maxAttempts) || 3),
+      memoryWritten: !!src.memoryWritten,
+      savedMemoryIds: Array.isArray(src.savedMemoryIds) ? src.savedMemoryIds : [],
+      lastError: src.lastError || '',
+      resultSummary: src.resultSummary || '',
+      diagnostics: src.diagnostics && typeof src.diagnostics === 'object' ? src.diagnostics : null,
+      createdAt: src.createdAt || now,
+      updatedAt: src.updatedAt || now,
+      nextRetryAt: src.nextRetryAt || 0
+    });
+    tasks.unshift(task);
+    await saveMemoryTasks(tasks);
+    return task;
+  }
+
+  async function updateMemoryTask(taskId, patch) {
+    if (!taskId) return null;
+    var tasks = await listMemoryTasks();
+    var idx = tasks.findIndex(function(t) { return t && t.id === taskId; });
+    if (idx === -1) return null;
+    var merged = Object.assign({}, tasks[idx], patch || {}, {
+      id: tasks[idx].id,
+      updatedAt: Date.now()
+    });
+    if (patch && patch.diagnostics && typeof patch.diagnostics === 'object') {
+      merged.diagnostics = Object.assign({}, tasks[idx].diagnostics || {}, patch.diagnostics);
+    }
+    if (patch && patch.lastError !== undefined) {
+      merged.lastError = sanitizeTaskErrorText(patch.lastError);
+    }
+    var next = normalizeMemoryTaskRecord(merged);
+    tasks[idx] = next;
+    await saveMemoryTasks(tasks);
+    return next;
+  }
+
+  async function clearFinishedMemoryTasks() {
+    var tasks = await listMemoryTasks();
+    var active = tasks.filter(function(t) {
+      return t && (t.status === 'pending' || t.status === 'running' || t.status === 'retry_waiting');
+    });
+    await saveMemoryTasks(active);
+    return active;
+  }
+
   global.AiWorkspaceStorage = {
     KEYS: KEYS,
     ACCENT_PRESETS: ACCENT_PRESETS,
+    MEMORY_CATEGORIES: MEMORY_CATEGORIES,
+    MEMORY_SCOPES: MEMORY_SCOPES,
+    MEMORY_STRATEGY_PRESETS: MEMORY_STRATEGY_PRESETS,
+    MEMORY_SETTING_BOUNDS: MEMORY_SETTING_BOUNDS,
+    DEFAULT_MEMORY_SETTINGS: DEFAULT_MEMORY_SETTINGS,
     normalizeBaseUrl: normalizeBaseUrl,
     normalizeTemperature: normalizeTemperature,
     isCustomApiComplete: isCustomApiComplete,
@@ -835,6 +1345,25 @@
     renameChat: renameChat,
     togglePinChat: togglePinChat,
     deleteChat: deleteChat,
-    searchChats: searchChats
+    searchChats: searchChats,
+    sanitizeMemorySettings: sanitizeMemorySettings,
+    getMemorySettings: getMemorySettings,
+    saveMemorySettings: saveMemorySettings,
+    applyMemoryStrategy: applyMemoryStrategy,
+    resetMemorySettingsToDefaults: resetMemorySettingsToDefaults,
+    listMemories: listMemories,
+    getMemory: getMemory,
+    createMemory: createMemory,
+    updateMemory: updateMemory,
+    deleteMemory: deleteMemory,
+    clearAllMemories: clearAllMemories,
+    listDeletedMemorySignatures: listDeletedMemorySignatures,
+    addDeletedMemorySignature: addDeletedMemorySignature,
+    removeDeletedMemorySignatureByContent: removeDeletedMemorySignatureByContent,
+    listMemoryTasks: listMemoryTasks,
+    saveMemoryTasks: saveMemoryTasks,
+    enqueueMemoryTask: enqueueMemoryTask,
+    updateMemoryTask: updateMemoryTask,
+    clearFinishedMemoryTasks: clearFinishedMemoryTasks
   };
 })(typeof window !== 'undefined' ? window : globalThis);

@@ -73,20 +73,29 @@
     return [];
   }
 
-  function extractNonStreamText(json) {
+  function extractNonStreamText(json, opts) {
     if (!json || typeof json !== 'object') return '';
     var choice = json.choices && json.choices[0];
     var msg = choice && choice.message;
     var content = msg ? msg.content : (choice && choice.text);
-    if (typeof content === 'string') return content;
+    if (typeof content === 'string' && content.trim()) return content;
     if (Array.isArray(content)) {
-      return content.map(function(part) {
+      var joined = content.map(function(part) {
         if (typeof part === 'string') return part;
         if (part && typeof part.text === 'string') return part.text;
         return '';
       }).join('');
+      if (joined.trim()) return joined;
     }
-    return '';
+    if (opts && opts.allowReasoningFallback && msg && typeof msg.reasoning_content === 'string' && msg.reasoning_content.trim()) {
+      return msg.reasoning_content;
+    }
+    if (Array.isArray(json.candidates) && json.candidates[0] && json.candidates[0].content && Array.isArray(json.candidates[0].content.parts)) {
+      return json.candidates[0].content.parts.map(function(p) {
+        return p && typeof p.text === 'string' ? p.text : '';
+      }).join('');
+    }
+    return typeof content === 'string' ? content : '';
   }
 
   function extractDeltaText(parsed) {
@@ -310,11 +319,14 @@
     };
   }
 
-  // ===== 提示词组装引擎（严格顺序：基础规则 -> 用户个性化 -> 预设角色 -> 历史消息 -> 当前用户输入） =====
+  // ===== 提示词组装引擎（严格顺序：1.基础系统规则 -> 2.个性化设置 -> 3.当前预设 -> 4.相关长期记忆 -> 5.跨窗口历史参考 -> 6.当前对话摘要 -> 7.近期原始消息 -> 8.当前用户输入） =====
   function composeSystemPrompt(options) {
     var opts = options && typeof options === 'object' ? options : {};
     var personalization = opts.personalization;
     var preset = opts.preset;
+    var shortTermSummary = String(opts.shortTermSummary || '').trim();
+    var memories = Array.isArray(opts.memories) ? opts.memories : [];
+    var crossChatContexts = Array.isArray(opts.crossChatContexts) ? opts.crossChatContexts : [];
     var deepThink = !!opts.deepThink;
 
     var sections = [];
@@ -325,7 +337,7 @@
       '你是「知屿」，运行在弯弯机中的个人 AI 工作空间助手。\n' +
       '- 请以清晰、准确、诚实且富有条理的方式回应用户的提问。\n' +
       '- 合适时可使用 Markdown 标题、列表、表格或 fenced 代码块组织回答。\n' +
-      '- 如遇到不确定的事实或尚未接入的能力（如长期记忆、插件执行、文件读取等），请直接说明，不要虚构。'
+      '- 如遇到不确定的事实或尚未接入的能力（如插件执行、文件读取等），请直接说明，不要虚构。'
     );
 
     // 2. 用户个性化配置（仅当启用时注入）
@@ -358,11 +370,70 @@
       }
     }
 
-    // 4. 若用户开启了深入思考 UI 开关，补充深度拆解提示
+    // 4. 按相关性筛选后的长期记忆（仅作参考辅助，不得覆盖系统规则或用户当前指令）
+    if (memories.length > 0) {
+      var memLines = memories.map(function(m) {
+        var cat = m.category ? '[' + String(m.category) + '] ' : '';
+        var st = String(m.status || 'active').toLowerCase();
+        var ts = String(m.temporalState || 'current').toLowerCase();
+        var statusTag = '';
+        if (st === 'cancelled' || ts === 'cancelled') {
+          statusTag = '[已取消 · 非当前目标] ';
+        } else if (st === 'completed' || ts === 'completed') {
+          statusTag = '[已完成] ';
+        } else if (st === 'historical' || ts === 'past') {
+          statusTag = '[历史记录 · 非当前偏好] ';
+        } else if (ts === 'future_plan') {
+          statusTag = '[计划中] ';
+        }
+        return '- ' + statusTag + cat + String(m.content || '').trim();
+      }).filter(Boolean);
+      if (memLines.length > 0) {
+        sections.push(
+          '【相关长期记忆（仅作参考，不可覆盖系统规则或用户当前明确指令）】\n' +
+          '以下内容是用户过往对话中沉淀的相关背景记忆，可自然参考以减少重复提问；标记为[历史记录]/[已取消]的内容代表已变更或取消的历史状态，请勿误当作当前目标或当前偏好；若与系统规则或用户本次明确要求冲突，一律以系统规则和用户当前指令为准：\n' +
+          memLines.join('\n')
+        );
+      }
+    }
+
+    // 5. 跨窗口历史对话摘要/片段参考（仅在开启跨窗口记忆与参考历史聊天且命中相关内容时注入）
+    if (crossChatContexts.length > 0) {
+      var crossLines = crossChatContexts.map(function(c) {
+        var label = c.chatTitle ? ('「' + String(c.chatTitle) + '」') : '「历史对话」';
+        return '- 来自' + label + '：' + String(c.content || '').trim();
+      }).filter(Boolean);
+      if (crossLines.length > 0) {
+        sections.push(
+          '【跨窗口相关历史参考（仅作辅助，不可覆盖系统规则或用户当前明确指令）】\n' +
+          '以下是用户在其他聊天窗口中曾提到过的相关上下文，请结合当前问题自然参考：\n' +
+          crossLines.join('\n')
+        );
+      }
+    }
+
+    // 6. 当前对话短期记忆摘要（覆盖更早历史轮次，避免重复叠加）
+    if (shortTermSummary) {
+      sections.push(
+        '【当前对话短期摘要（较早轮次阶段性总结）】\n' +
+        '以下为本对话此前轮次的核心上下文摘要，后续消息列表仅保留最近原始对话：\n' +
+        shortTermSummary
+      );
+    }
+
+    // 深入思考模式补充提示
     if (deepThink) {
       sections.push(
         '【思考模式要求】\n' +
         '用户开启了「深入思考」模式。请在给出最终结论前，先在逻辑上充分推演关键约束、潜在边界情况与步骤依据，再输出条理分明的完整回答。'
+      );
+    }
+
+    // 记忆系统真实执行状态提醒（如：需要向用户追问澄清、已拦截或关闭时，禁止假装“已记住/已删除”）
+    if (opts.memoryTurnNotice && String(opts.memoryTurnNotice).trim()) {
+      sections.push(
+        '【本轮记忆系统真实状态提醒】\n' +
+        String(opts.memoryTurnNotice).trim()
       );
     }
 
@@ -371,15 +442,35 @@
 
   function composeMessages(options) {
     var opts = options && typeof options === 'object' ? options : {};
+    var history = Array.isArray(opts.historyMessages) ? opts.historyMessages : [];
+    var shortTermSummary = String(opts.shortTermSummary || '').trim();
+    var summaryUpToCount = Math.max(0, Number(opts.summaryUpToCount) || 0);
+    var hasExplicitLimit = opts.maxRecentMessages !== undefined && opts.maxRecentMessages !== null;
+    var parsedLimit = Number(opts.maxRecentMessages);
+    var maxRecent = hasExplicitLimit && Number.isFinite(parsedLimit)
+      ? Math.max(0, Math.round(parsedLimit))
+      : 6;
+
+    // 7. 近期原始消息：若存在短期摘要且覆盖前 summaryUpToCount 条，则只取未摘要的最近原始消息
+    var recentSlice = [];
+    if (maxRecent > 0) {
+      recentSlice = history;
+      if (shortTermSummary && summaryUpToCount > 0 && summaryUpToCount < history.length) {
+        recentSlice = history.slice(summaryUpToCount);
+      }
+      if (recentSlice.length > maxRecent) {
+        recentSlice = recentSlice.slice(recentSlice.length - maxRecent);
+      }
+    }
+
     var systemText = composeSystemPrompt(opts);
     var out = [];
     if (systemText) {
       out.push({ role: 'system', content: systemText });
     }
 
-    var history = Array.isArray(opts.historyMessages) ? opts.historyMessages : [];
-    for (var i = 0; i < history.length; i++) {
-      var msg = history[i];
+    for (var i = 0; i < recentSlice.length; i++) {
+      var msg = recentSlice[i];
       if (!msg || (msg.role !== 'user' && msg.role !== 'assistant')) continue;
       var text = String(msg.content || '').trim();
       if (!text) continue;
@@ -387,6 +478,7 @@
       out.push({ role: msg.role, content: String(msg.content) });
     }
 
+    // 8. 当前用户输入
     if (opts.userContent != null && String(opts.userContent).trim()) {
       out.push({ role: 'user', content: String(opts.userContent) });
     }
@@ -594,6 +686,95 @@
     };
   }
 
+  // ===== 轻量单次非流式请求（供后台自动记忆提取、短期摘要与跨窗口辅助检索复用当前知屿有效 API 配置） =====
+  async function requestChatCompletion(options) {
+    var opts = options && typeof options === 'object' ? options : {};
+    var cfg = (opts.apiConfig && (opts.apiConfig.url || opts.apiConfig.baseUrl) && (opts.apiConfig.key || opts.apiConfig.apiKey))
+      ? opts.apiConfig
+      : (await resolveEffectiveApiConfig());
+    var url = normalizeBaseUrl(cfg.url || cfg.baseUrl);
+    var key = String(cfg.key || cfg.apiKey || '').trim();
+    var model = String(opts.model || cfg.model || '').trim();
+    var temperature = normalizeTemperature(opts.temperature, 0.1);
+    var messages = Array.isArray(opts.messages) ? opts.messages : [];
+
+    if (!url || !key || !model) {
+      throw new Error('API 未完整配置');
+    }
+
+    var body = {
+      model: model,
+      messages: messages,
+      temperature: temperature,
+      stream: false
+    };
+    if (opts.maxTokens && Number(opts.maxTokens) > 0) {
+      body.max_tokens = Math.round(Number(opts.maxTokens));
+    }
+
+    var endpoint = buildChatCompletionsUrl(url);
+    var res = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: 'Bearer ' + key
+      },
+      body: JSON.stringify(body),
+      signal: opts.signal
+    });
+    var rawText = await res.text();
+    var contentType = (res.headers && res.headers.get && res.headers.get('content-type')) || '';
+
+    if (!res.ok) {
+      var errJson = null;
+      try { errJson = rawText ? JSON.parse(rawText) : {}; } catch (_) {}
+      var detail = (errJson && ((errJson.error && errJson.error.message) || errJson.message || errJson.error)) || rawText || ('HTTP ' + res.status);
+      var err = new Error('HTTP ' + res.status + '：' + String(detail).slice(0, 200));
+      err.status = res.status;
+      throw err;
+    }
+
+    // 部分反代/网关即使 stream=false 仍可能返回 SSE 文本流，兼容解析
+    if (/text\/event-stream/i.test(contentType) || /^\s*data:\s*/m.test(rawText)) {
+      var sseLines = rawText.split(/\r?\n/);
+      var sseText = '';
+      for (var i = 0; i < sseLines.length; i++) {
+        var line = sseLines[i].trim();
+        if (!line || line.indexOf('data:') !== 0) continue;
+        var payload = line.slice(5).trim();
+        if (!payload || payload === '[DONE]') continue;
+        try {
+          var chunk = JSON.parse(payload);
+          var delta = extractDeltaText(chunk);
+          if (delta) sseText += delta;
+        } catch (_) {}
+      }
+      if (sseText.trim()) {
+        return {
+          content: sseText.trim(),
+          model: model,
+          source: cfg.source || 'unknown'
+        };
+      }
+    }
+
+    var json = null;
+    try {
+      json = rawText ? JSON.parse(rawText) : {};
+    } catch (_) {
+      json = null;
+    }
+    if (!json) throw new Error('API 返回了无法解析的 JSON 响应');
+    if (json.error) {
+      throw new Error((json.error && json.error.message) || String(json.error));
+    }
+    return {
+      content: extractNonStreamText(json, { allowReasoningFallback: !!opts.allowReasoningFallback }).trim(),
+      model: (json && json.model) || model,
+      source: cfg.source || 'unknown'
+    };
+  }
+
   global.AiWorkspaceAI = {
     normalizeBaseUrl: normalizeBaseUrl,
     normalizeTemperature: normalizeTemperature,
@@ -609,6 +790,7 @@
     testConnection: testConnection,
     composeSystemPrompt: composeSystemPrompt,
     composeMessages: composeMessages,
-    streamChatCompletion: streamChatCompletion
+    streamChatCompletion: streamChatCompletion,
+    requestChatCompletion: requestChatCompletion
   };
 })(typeof window !== 'undefined' ? window : globalThis);

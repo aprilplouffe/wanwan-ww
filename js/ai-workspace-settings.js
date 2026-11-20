@@ -43,7 +43,26 @@
     general: null,
     presets: [],
     customApi: null,
-    effectiveApi: null
+    effectiveApi: null,
+    memorySettings: {
+      shortTermContext: true,
+      crossChatMemory: true,
+      useMemory: true,
+      autoMemory: true,
+      referenceHistoryChats: true,
+      strategy: 'natural',
+      summaryTriggerChars: 3200,
+      recentRawMessagesLimit: 6,
+      maxMemoryRecallCount: 5,
+      maxSingleMemoryLength: 260
+    },
+    memories: [],
+    memoryTasks: [],
+    chats: [],
+    activeChatId: '',
+    recentSelectedChatId: '',
+    advancedMemoryOpen: false,
+    memorySearchQuery: ''
   };
 
   function S() {
@@ -52,6 +71,10 @@
 
   function AI() {
     return global.AiWorkspaceAI;
+  }
+
+  function M() {
+    return global.AiWorkspaceMemory;
   }
 
   function escapeHtml(str) {
@@ -147,7 +170,24 @@
       store.getAppearance(),
       store.getGeneralSettings(),
       store.listPresets(),
-      store.getCustomApiConfig()
+      store.getCustomApiConfig(),
+      typeof store.getMemorySettings === 'function'
+        ? store.getMemorySettings()
+        : Promise.resolve({
+            shortTermContext: true,
+            crossChatMemory: true,
+            useMemory: true,
+            autoMemory: true,
+            referenceHistoryChats: true,
+            strategy: 'natural',
+            summaryTriggerChars: 3200,
+            recentRawMessagesLimit: 6,
+            maxMemoryRecallCount: 5,
+            maxSingleMemoryLength: 260
+          }),
+      typeof store.listMemories === 'function' ? store.listMemories() : Promise.resolve([]),
+      typeof store.listMemoryTasks === 'function' ? store.listMemoryTasks() : Promise.resolve([]),
+      typeof store.listChats === 'function' ? store.listChats() : Promise.resolve([])
     ]);
     _ctx.profile = results[0];
     _ctx.personalization = results[1];
@@ -155,6 +195,10 @@
     _ctx.general = results[3];
     _ctx.presets = results[4];
     _ctx.customApi = results[5];
+    _ctx.memorySettings = results[6] || _ctx.memorySettings;
+    _ctx.memories = results[7] || [];
+    _ctx.memoryTasks = results[8] || [];
+    _ctx.chats = results[9] || [];
     if (AI() && typeof AI().resolveEffectiveApiConfig === 'function') {
       _ctx.effectiveApi = await AI().resolveEffectiveApiConfig();
     }
@@ -169,7 +213,9 @@
         general: _ctx.general,
         presets: _ctx.presets,
         customApi: _ctx.customApi,
-        effectiveApi: _ctx.effectiveApi
+        effectiveApi: _ctx.effectiveApi,
+        memorySettings: _ctx.memorySettings,
+        memories: _ctx.memories
       });
     }
   }
@@ -254,6 +300,10 @@
     var apiStatusVal = customApi.complete
       ? ('专属 · ' + (customApi.model || '已配置'))
       : '使用主 API';
+    var memSettings = _ctx.memorySettings || { shortTermContext: true, crossChatMemory: true, useMemory: true, autoMemory: true };
+    var memCount = (_ctx.memories || []).length;
+    var anyMemoryActive = !!(memSettings.shortTermContext || memSettings.crossChatMemory || memSettings.useMemory || memSettings.autoMemory);
+    var memorySummary = anyMemoryActive ? (memCount + ' 条') : '已关闭';
 
     return (
       '<div class="aiw-st-topbar">' +
@@ -298,10 +348,10 @@
             '<span class="aiw-st-row-val">' + escapeHtml(presetSummary) + '</span>' +
             '<span class="aiw-st-row-arrow"><i class="fa-solid fa-angle-right"></i></span>' +
           '</button>' +
-          '<button type="button" class="aiw-st-row" data-st-action="memory-entry">' +
+          '<button type="button" class="aiw-st-row" data-st-nav="memory">' +
             '<span class="aiw-st-row-icon"><i class="fa-regular fa-bookmark"></i></span>' +
             '<span class="aiw-st-row-label">记忆</span>' +
-            '<span class="aiw-st-row-tag">待接入</span>' +
+            '<span class="aiw-st-row-val">' + escapeHtml(memorySummary) + '</span>' +
             '<span class="aiw-st-row-arrow"><i class="fa-solid fa-angle-right"></i></span>' +
           '</button>' +
           '<button type="button" class="aiw-st-row" data-st-action="plugins-entry">' +
@@ -1521,6 +1571,7 @@
     saveBtn.addEventListener('click', doSaveCustomApi);
     saveTopBtn.addEventListener('click', doSaveCustomApi);
 
+    var okBtn = null;
     clearBtn.addEventListener('click', function() {
       showConfirmModal(
         '清空专属 API 配置',
@@ -1539,6 +1590,828 @@
         }
       );
     });
+    void okBtn;
+  }
+
+  // ===== 视图 7：长期记忆管理（第五阶段） =====
+  function formatMemoryDate(ts) {
+    if (!ts) return '';
+    var d = new Date(ts);
+    if (isNaN(d.getTime())) return '';
+    var pad = function(n) { return n < 10 ? '0' + n : String(n); };
+    return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) + ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes());
+  }
+
+  function formatScopeLabel(scope) {
+    if (scope === 'chat') return '仅当前对话';
+    if (scope === 'project') return '项目记忆';
+    return '跨窗口共享';
+  }
+
+  function getFilteredMemories() {
+    var list = Array.isArray(_ctx.memories) ? _ctx.memories : [];
+    var q = String(_ctx.memorySearchQuery || '').trim().toLowerCase();
+    if (!q) return list;
+    return list.filter(function(m) {
+      return String(m.content || '').toLowerCase().indexOf(q) !== -1 ||
+        String(m.category || '').toLowerCase().indexOf(q) !== -1 ||
+        String(m.sourceChatTitle || '').toLowerCase().indexOf(q) !== -1;
+    });
+  }
+
+  function renderMemoryCardsHtml(list) {
+    if (!list.length) {
+      var hasQuery = !!String(_ctx.memorySearchQuery || '').trim();
+      return (
+        '<div class="aiw-mem-empty">' +
+          '<div class="aiw-mem-empty-icon"><i class="fa-regular fa-bookmark"></i></div>' +
+          '<div class="aiw-mem-empty-title">' + (hasQuery ? '没有匹配的长期记忆' : '还没有保存任何长期记忆') + '</div>' +
+          '<div class="aiw-mem-empty-sub">' +
+            (hasQuery
+              ? '换个关键词试试，或清空搜索查看全部记忆。'
+              : '当开启「自动记忆」后，知屿会在对话中自动记住你的偏好、习惯、长期计划与重要决定，也可以点击右上角手动新增。') +
+          '</div>' +
+        '</div>'
+      );
+    }
+
+    return list.map(function(m) {
+      var sourceLabel = m.sourceChatTitle ? ('来源：' + m.sourceChatTitle) : '手动添加';
+      if (m.factSource === 'context_resolved') sourceLabel += ' · 上下文指代消解';
+      var timeLabel = formatMemoryDate(m.updatedAt || m.createdAt);
+      var statusLabel = '';
+      var st = String(m.status || 'active').toLowerCase();
+      var ts = String(m.temporalState || 'current').toLowerCase();
+      if (st === 'cancelled' || ts === 'cancelled') statusLabel = '已取消';
+      else if (st === 'completed' || ts === 'completed') statusLabel = '已完成';
+      else if (st === 'historical' || ts === 'past') statusLabel = '历史记录';
+      else if (ts === 'future_plan') statusLabel = '计划中';
+
+      var confPct = typeof m.confidence === 'number' && Number.isFinite(m.confidence)
+        ? Math.round(m.confidence * 100) + '%'
+        : '';
+      var prevHint = m.previousContent ? ('变更自「' + m.previousContent + '」') : '';
+
+      return (
+        '<div class="aiw-mem-card" data-mem-id="' + escapeHtml(m.id) + '">' +
+          '<div class="aiw-mem-card-top">' +
+            '<div class="aiw-mem-badges">' +
+              '<span class="aiw-mem-badge is-cat">' + escapeHtml(m.category || '备忘') + '</span>' +
+              (statusLabel ? '<span class="aiw-mem-badge is-status">' + escapeHtml(statusLabel) + '</span>' : '') +
+              '<span class="aiw-mem-badge is-scope">' + escapeHtml(formatScopeLabel(m.scope)) + '</span>' +
+              '<span class="aiw-mem-badge is-imp">重要度 ' + escapeHtml(String(m.importance || 3)) + '/5</span>' +
+              (confPct ? '<span class="aiw-mem-badge is-conf">置信 ' + escapeHtml(confPct) + '</span>' : '') +
+            '</div>' +
+          '</div>' +
+          '<div class="aiw-mem-content">' + escapeHtml(m.content) + '</div>' +
+          (prevHint ? '<div class="aiw-mem-meta" style="margin-top:4px;"><span class="aiw-mem-source">' + escapeHtml(prevHint) + '</span></div>' : '') +
+          '<div class="aiw-mem-meta">' +
+            '<span class="aiw-mem-source">' + escapeHtml(sourceLabel) + '</span>' +
+            (timeLabel ? '<span class="aiw-mem-time">' + escapeHtml(timeLabel) + '</span>' : '') +
+          '</div>' +
+          '<div class="aiw-mem-actions">' +
+            '<button type="button" class="aiw-preset-act" data-mem-act="edit" data-mem-id="' + escapeHtml(m.id) + '"><i class="fa-regular fa-pen-to-square"></i> 编辑</button>' +
+            '<button type="button" class="aiw-preset-act is-danger" data-mem-act="delete" data-mem-id="' + escapeHtml(m.id) + '"><i class="fa-regular fa-trash-can"></i> 删除</button>' +
+          '</div>' +
+        '</div>'
+      );
+    }).join('');
+  }
+
+  function renderMemoryTasksHtml(tasks) {
+    var list = Array.isArray(tasks) ? tasks : [];
+    if (!list.length) {
+      return (
+        '<div id="aiw-mem-task-section">' +
+          '<div class="aiw-st-group-title" style="margin-top:18px;">记忆写入诊断记录</div>' +
+          '<div class="aiw-st-card aiw-st-pad" id="aiw-mem-task-panel">' +
+            '<div class="aiw-mem-task-empty">暂无后台记忆提取或摘要任务记录，发送对话后将在此实时显示状态与写入结果。</div>' +
+          '</div>' +
+        '</div>'
+      );
+    }
+
+    var failedCount = list.filter(function(t) { return t && (t.status === 'failed' || t.status === 'retry_waiting'); }).length;
+    var statusTextMap = {
+      pending: '等待中',
+      running: '运行中',
+      saved: '已保存',
+      skipped: '已跳过',
+      retry_waiting: '等待重试',
+      failed: '失败'
+    };
+    var typeTextMap = {
+      explicit_memory: '明确记住',
+      explicit_update: '修改记忆',
+      explicit_delete: '遗忘删除',
+      extract_memory: '自动提取',
+      summarize_chat: '短期摘要'
+    };
+
+    var rowsHtml = list.slice(0, 8).map(function(t) {
+      var typeLabel = typeTextMap[t.type] || '自动提取';
+      var stLabel = statusTextMap[t.status] || t.status || '等待中';
+      var timeText = formatMemoryDate(t.createdAt);
+      var writtenLabel = t.memoryWritten
+        ? ('已写入' + (t.savedMemoryIds && t.savedMemoryIds.length ? (' ' + t.savedMemoryIds.length + ' 条 (' + t.savedMemoryIds.join(', ') + ')') : ''))
+        : '未写入';
+      var errLine = (t.status === 'failed' || t.status === 'retry_waiting') && t.lastError
+        ? ('<div class="aiw-mem-task-err">错误：' + escapeHtml(t.lastError) + '</div>')
+        : (t.resultSummary ? ('<div class="aiw-mem-task-sub">' + escapeHtml(t.resultSummary) + '</div>') : '');
+
+      var diagLine = '';
+      if (t.diagnostics && typeof t.diagnostics === 'object') {
+        var d = t.diagnostics;
+        var diagParts = [
+          '判断:' + (d.enteredAutoJudgment ? '是' : '否'),
+          '请求模型:' + (d.modelRequested ? '是' : '否'),
+          '候选:' + (d.modelReturnedCandidates ? (d.candidateCount || 1) : 0),
+          '达标:' + (d.passedValueGate ? '是' : '否'),
+          '写库:' + (d.dbWriteAttempted ? (d.dbWriteSucceeded ? ('成功(' + (d.writtenCount || 0) + ')') : '失败') : '未执行')
+        ];
+        diagLine = '<div class="aiw-mem-task-sub" style="opacity:0.85;">' + escapeHtml(diagParts.join(' · ')) + '</div>';
+      }
+
+      return (
+        '<div class="aiw-mem-task-item is-' + escapeHtml(t.status || 'pending') + '">' +
+          '<div class="aiw-mem-task-top">' +
+            '<span class="aiw-mem-task-type">' + escapeHtml(typeLabel) + ' · ' + escapeHtml(t.chatTitle || '对话') + '</span>' +
+            '<span class="aiw-mem-task-badge is-' + escapeHtml(t.status || 'pending') + '">' + escapeHtml(stLabel) + (t.attempts ? (' · ' + t.attempts + '次') : '') + '</span>' +
+          '</div>' +
+          '<div class="aiw-mem-task-meta">' +
+            '<span>' + (timeText ? escapeHtml(timeText) : '刚刚') + '</span>' +
+            '<span class="aiw-mem-task-write ' + (t.memoryWritten ? 'is-written' : 'is-unwritten') + '">' + escapeHtml(writtenLabel) + '</span>' +
+          '</div>' +
+          errLine +
+          diagLine +
+        '</div>'
+      );
+    }).join('');
+
+    return (
+      '<div id="aiw-mem-task-section">' +
+        '<div class="aiw-st-group-title" style="margin-top:18px;">记忆写入诊断记录</div>' +
+        '<div class="aiw-st-card aiw-st-pad" id="aiw-mem-task-panel">' +
+          '<div class="aiw-mem-task-head">' +
+            '<span class="aiw-pr-count">最近 ' + Math.min(8, list.length) + ' / 共 ' + list.length + ' 条' + (failedCount ? (' · ' + failedCount + ' 条待重试/失败') : '') + '</span>' +
+            '<div class="aiw-mem-task-btns">' +
+              (failedCount
+                ? '<button type="button" class="aiw-st-btn-secondary aiw-st-btn-sm" id="aiw-mem-retry-tasks"><i class="fa-solid fa-rotate-right"></i> 重试失败</button>'
+                : '') +
+              '<button type="button" class="aiw-st-btn-secondary aiw-st-btn-sm" id="aiw-mem-clear-tasks">清理已完成</button>' +
+            '</div>' +
+          '</div>' +
+          '<div class="aiw-mem-task-list">' + rowsHtml + '</div>' +
+        '</div>' +
+      '</div>'
+    );
+  }
+
+  function resolveRecentTargetChat() {
+    var chats = Array.isArray(_ctx.chats) ? _ctx.chats : [];
+    if (!chats.length) return null;
+    var targetId = _ctx.recentSelectedChatId || _ctx.activeChatId;
+    var found = targetId ? chats.find(function(c) { return c && c.id === targetId; }) : null;
+    return found || chats[0];
+  }
+
+  function getRecentSummaryBadgeText() {
+    var chat = resolveRecentTargetChat();
+    if (!chat) return '暂无对话';
+    var msgs = (chat.messages || []).filter(function(m) { return m && String(m.content || '').trim(); });
+    var upTo = Math.max(0, Number(chat.summaryUpToCount) || 0);
+    var unsummarized = Math.max(0, msgs.length - upTo);
+    return unsummarized + ' 条近期消息';
+  }
+
+  function renderMemoryPageHtml() {
+    var ms = _ctx.memorySettings || {};
+    var strategyPresets = (S() && S().MEMORY_STRATEGY_PRESETS) || {
+      natural: { id: 'natural', label: '自然 · 推荐', desc: '平衡上下文与召回' },
+      token_saver: { id: 'token_saver', label: '省 Token', desc: '更早压缩、少条召回' },
+      recall_more: { id: 'recall_more', label: '记得更多', desc: '保留更多近期轮数与记忆' }
+    };
+    var bounds = (S() && S().MEMORY_SETTING_BOUNDS) || {
+      summaryTriggerChars: { min: 400, max: 12000, def: 3200 },
+      recentRawMessagesLimit: { min: 2, max: 24, def: 6 },
+      maxMemoryRecallCount: { min: 1, max: 12, def: 5 },
+      maxSingleMemoryLength: { min: 60, max: 500, def: 260 }
+    };
+    var currentStrategy = ms.strategy || 'natural';
+    var allList = _ctx.memories || [];
+    var filtered = getFilteredMemories();
+
+    var strategyHtml = ['natural', 'token_saver', 'recall_more'].map(function(key) {
+      var item = strategyPresets[key] || { id: key, label: key, desc: '' };
+      var activeCls = currentStrategy === key ? ' active' : '';
+      return (
+        '<button type="button" class="aiw-mem-strategy-card' + activeCls + '" data-mem-strategy="' + escapeHtml(key) + '">' +
+          '<div class="aiw-mem-strategy-title">' + escapeHtml(item.label) + '</div>' +
+          '<div class="aiw-mem-strategy-desc">' + escapeHtml(item.desc) + '</div>' +
+        '</button>'
+      );
+    }).join('');
+
+    return (
+      '<div class="aiw-st-topbar">' +
+        '<button type="button" class="aiw-circle-btn" id="aiw-st-sub-back" aria-label="返回设置">' +
+          '<i class="fa-solid fa-arrow-left"></i>' +
+        '</button>' +
+        '<div class="aiw-st-topbar-title">记忆</div>' +
+        '<button type="button" class="aiw-st-top-action" id="aiw-mem-add-btn"><i class="fa-solid fa-plus"></i> 新增</button>' +
+      '</div>' +
+
+      '<div class="aiw-st-scroll">' +
+        '<div class="aiw-st-card" style="margin-bottom:12px;">' +
+          '<button type="button" class="aiw-st-row" id="aiw-mem-open-recent">' +
+            '<span class="aiw-st-row-icon"><i class="fa-regular fa-comments"></i></span>' +
+            '<div class="aiw-st-row-col">' +
+              '<div class="aiw-st-row-label">近期记忆</div>' +
+              '<div class="aiw-st-row-desc">查看当前对话近期上下文与阶段性摘要（不同于永久长期记忆）</div>' +
+            '</div>' +
+            '<span class="aiw-st-row-val">' + escapeHtml(getRecentSummaryBadgeText()) + '</span>' +
+            '<span class="aiw-st-row-arrow"><i class="fa-solid fa-angle-right"></i></span>' +
+          '</button>' +
+        '</div>' +
+
+        '<div class="aiw-st-group-title">基础记忆开关</div>' +
+        '<div class="aiw-st-card">' +
+          '<div class="aiw-st-row aiw-st-row-static">' +
+            '<div class="aiw-st-row-col">' +
+              '<div class="aiw-st-row-label">短期上下文</div>' +
+              '<div class="aiw-st-row-desc">保留当前对话近期原始消息，超长后自动生成阶段性摘要</div>' +
+            '</div>' +
+            '<label class="aiw-switch">' +
+              '<input type="checkbox" id="aiw-mem-short-toggle"' + (ms.shortTermContext !== false ? ' checked' : '') + '>' +
+              '<span class="aiw-switch-track"></span>' +
+            '</label>' +
+          '</div>' +
+          '<div class="aiw-st-row aiw-st-row-static">' +
+            '<div class="aiw-st-row-col">' +
+              '<div class="aiw-st-row-label">跨窗口记忆</div>' +
+              '<div class="aiw-st-row-desc">新建或切换对话时允许跨窗口共享用户级长期记忆</div>' +
+            '</div>' +
+            '<label class="aiw-switch">' +
+              '<input type="checkbox" id="aiw-mem-cross-toggle"' + (ms.crossChatMemory !== false ? ' checked' : '') + '>' +
+              '<span class="aiw-switch-track"></span>' +
+            '</label>' +
+          '</div>' +
+          '<div class="aiw-st-row aiw-st-row-static">' +
+            '<div class="aiw-st-row-col">' +
+              '<div class="aiw-st-row-label">使用长期记忆</div>' +
+              '<div class="aiw-st-row-desc">回答时自动检索长期记忆，并响应「帮我记住」等明确指令</div>' +
+            '</div>' +
+            '<label class="aiw-switch">' +
+              '<input type="checkbox" id="aiw-mem-use-toggle"' + (ms.useMemory !== false ? ' checked' : '') + '>' +
+              '<span class="aiw-switch-track"></span>' +
+            '</label>' +
+          '</div>' +
+          '<div class="aiw-st-row aiw-st-row-static">' +
+            '<div class="aiw-st-row-col">' +
+              '<div class="aiw-st-row-label">自动记忆</div>' +
+              '<div class="aiw-st-row-desc">普通聊天中自动识别偏好、习惯、计划与项目（绝不保存密钥）</div>' +
+            '</div>' +
+            '<label class="aiw-switch">' +
+              '<input type="checkbox" id="aiw-mem-auto-toggle"' + (ms.autoMemory !== false ? ' checked' : '') + '>' +
+              '<span class="aiw-switch-track"></span>' +
+            '</label>' +
+          '</div>' +
+          '<div class="aiw-st-row aiw-st-row-static">' +
+            '<div class="aiw-st-row-col">' +
+              '<div class="aiw-st-row-label">参考历史聊天</div>' +
+              '<div class="aiw-st-row-desc">检索其他聊天窗口的近期片段与摘要（独立于永久长期记忆库）</div>' +
+            '</div>' +
+            '<label class="aiw-switch">' +
+              '<input type="checkbox" id="aiw-mem-ref-history-toggle"' + (ms.referenceHistoryChats !== false ? ' checked' : '') + '>' +
+              '<span class="aiw-switch-track"></span>' +
+            '</label>' +
+          '</div>' +
+        '</div>' +
+
+        '<div class="aiw-st-group-title" style="margin-top:16px;">记忆策略</div>' +
+        '<div class="aiw-mem-strategy-grid">' + strategyHtml + '</div>' +
+
+        '<div class="aiw-st-card" style="margin-top:12px;">' +
+          '<button type="button" class="aiw-st-row" id="aiw-mem-adv-toggle">' +
+            '<span class="aiw-st-row-icon"><i class="fa-solid fa-sliders"></i></span>' +
+            '<div class="aiw-st-row-col">' +
+              '<div class="aiw-st-row-label">高级设置</div>' +
+              '<div class="aiw-st-row-desc">摘要阈值 ' + escapeHtml(String(ms.summaryTriggerChars || 3200)) + ' 字 · 近期 ' + escapeHtml(String(ms.recentRawMessagesLimit || 6)) + ' 条 · 召回 ' + escapeHtml(String(ms.maxMemoryRecallCount || 5)) + ' 条</div>' +
+            '</div>' +
+            '<span class="aiw-st-row-arrow"><i class="fa-solid fa-angle-' + (_ctx.advancedMemoryOpen ? 'up' : 'down') + '"></i></span>' +
+          '</button>' +
+          '<div class="aiw-mem-adv-body" id="aiw-mem-adv-body"' + (_ctx.advancedMemoryOpen ? '' : ' hidden') + '>' +
+            '<div class="aiw-mem-adv-grid">' +
+              '<div class="aiw-mem-adv-field">' +
+                '<label class="aiw-field-label" for="aiw-adv-trigger-chars">触发摘要字符阈值 (' + bounds.summaryTriggerChars.min + '-' + bounds.summaryTriggerChars.max + ')</label>' +
+                '<input type="number" class="aiw-field-input" id="aiw-adv-trigger-chars" min="' + bounds.summaryTriggerChars.min + '" max="' + bounds.summaryTriggerChars.max + '" value="' + escapeHtml(String(ms.summaryTriggerChars || bounds.summaryTriggerChars.def)) + '">' +
+              '</div>' +
+              '<div class="aiw-mem-adv-field">' +
+                '<label class="aiw-field-label" for="aiw-adv-recent-limit">近期原始消息条数 (' + bounds.recentRawMessagesLimit.min + '-' + bounds.recentRawMessagesLimit.max + ')</label>' +
+                '<input type="number" class="aiw-field-input" id="aiw-adv-recent-limit" min="' + bounds.recentRawMessagesLimit.min + '" max="' + bounds.recentRawMessagesLimit.max + '" value="' + escapeHtml(String(ms.recentRawMessagesLimit || bounds.recentRawMessagesLimit.def)) + '">' +
+              '</div>' +
+              '<div class="aiw-mem-adv-field">' +
+                '<label class="aiw-field-label" for="aiw-adv-recall-count">单次最多召回记忆 (' + bounds.maxMemoryRecallCount.min + '-' + bounds.maxMemoryRecallCount.max + ')</label>' +
+                '<input type="number" class="aiw-field-input" id="aiw-adv-recall-count" min="' + bounds.maxMemoryRecallCount.min + '" max="' + bounds.maxMemoryRecallCount.max + '" value="' + escapeHtml(String(ms.maxMemoryRecallCount || bounds.maxMemoryRecallCount.def)) + '">' +
+              '</div>' +
+              '<div class="aiw-mem-adv-field">' +
+                '<label class="aiw-field-label" for="aiw-adv-mem-len">单条记忆最大字符 (' + bounds.maxSingleMemoryLength.min + '-' + bounds.maxSingleMemoryLength.max + ')</label>' +
+                '<input type="number" class="aiw-field-input" id="aiw-adv-mem-len" min="' + bounds.maxSingleMemoryLength.min + '" max="' + bounds.maxSingleMemoryLength.max + '" value="' + escapeHtml(String(ms.maxSingleMemoryLength || bounds.maxSingleMemoryLength.def)) + '">' +
+              '</div>' +
+            '</div>' +
+            '<div class="aiw-mem-adv-actions">' +
+              '<button type="button" class="aiw-st-btn-secondary aiw-st-btn-sm" id="aiw-mem-adv-reset">恢复默认设置</button>' +
+              '<button type="button" class="aiw-st-btn-primary aiw-st-btn-sm" id="aiw-mem-adv-save">保存高级参数</button>' +
+            '</div>' +
+          '</div>' +
+        '</div>' +
+
+        '<div class="aiw-mem-toolbar">' +
+          '<div class="aiw-mem-search-wrap">' +
+            '<i class="fa-solid fa-magnifying-glass"></i>' +
+            '<input type="search" class="aiw-mem-search-input" id="aiw-mem-search" value="' + escapeHtml(_ctx.memorySearchQuery || '') + '" placeholder="搜索长期记忆内容、分类或来源对话">' +
+          '</div>' +
+        '</div>' +
+
+        '<div class="aiw-mem-count-bar">' +
+          '<span class="aiw-pr-count" id="aiw-mem-count-text">共 ' + allList.length + ' 条长期记忆' + (_ctx.memorySearchQuery ? ('（筛选出 ' + filtered.length + ' 条）') : '') + '</span>' +
+          '<button type="button" class="aiw-st-btn-secondary aiw-st-btn-sm aiw-btn-text-danger" id="aiw-mem-clear-all"' + (allList.length ? '' : ' disabled') + '>' +
+            '<i class="fa-regular fa-trash-can"></i> 清空全部' +
+          '</button>' +
+        '</div>' +
+
+        '<div class="aiw-mem-list" id="aiw-mem-list">' + renderMemoryCardsHtml(filtered) + '</div>' +
+        renderMemoryTasksHtml(_ctx.memoryTasks) +
+      '</div>'
+    );
+  }
+
+  function renderRecentMemoryHtml() {
+    var ms = _ctx.memorySettings || {};
+    var chats = Array.isArray(_ctx.chats) ? _ctx.chats : [];
+    var targetChat = resolveRecentTargetChat();
+    var limit = Math.max(2, Number(ms.recentRawMessagesLimit) || 6);
+    var cleanMsgs = targetChat && Array.isArray(targetChat.messages)
+      ? targetChat.messages.filter(function(m) { return m && (m.role === 'user' || m.role === 'assistant') && String(m.content || '').trim(); })
+      : [];
+    var summaryUpTo = targetChat ? Math.min(cleanMsgs.length, Math.max(0, Number(targetChat.summaryUpToCount) || 0)) : 0;
+    var unsummarized = cleanMsgs.slice(summaryUpTo);
+    var activeStartIdx = Math.max(0, unsummarized.length - limit);
+
+    var selectorHtml = chats.length
+      ? (
+        '<div class="aiw-st-card aiw-st-pad" style="margin-top:12px;">' +
+          '<label class="aiw-field-label" for="aiw-rm-chat-select">查看对话窗口</label>' +
+          '<select class="aiw-api-select" id="aiw-rm-chat-select">' +
+            chats.map(function(c) {
+              var selected = targetChat && c.id === targetChat.id ? ' selected' : '';
+              return '<option value="' + escapeHtml(c.id) + '"' + selected + '>' + escapeHtml(c.title || '新对话') + ' (' + ((c.messages || []).length) + ' 条)</option>';
+            }).join('') +
+          '</select>' +
+        '</div>'
+      )
+      : '';
+
+    var summaryBodyHtml = !targetChat
+      ? '<div class="aiw-mem-task-empty">当前还没有历史对话记录。发起对话后，近期工作记忆将在这里展示。</div>'
+      : (
+        '<div class="aiw-rm-stats-row">' +
+          '<div class="aiw-rm-stat"><span class="aiw-rm-stat-num">' + unsummarized.length + '</span><span class="aiw-rm-stat-lbl">未摘要近期消息</span></div>' +
+          '<div class="aiw-rm-stat"><span class="aiw-rm-stat-num">' + Math.min(limit, unsummarized.length) + ' / ' + limit + '</span><span class="aiw-rm-stat-lbl">下轮保留原文窗口</span></div>' +
+          '<div class="aiw-rm-stat"><span class="aiw-rm-stat-num">' + summaryUpTo + '</span><span class="aiw-rm-stat-lbl">已压缩历史条数</span></div>' +
+        '</div>' +
+        '<div class="aiw-rm-summary-box">' +
+          '<div class="aiw-rm-summary-head">' +
+            '<span>当前阶段性摘要</span>' +
+            (targetChat.summaryUpdatedAt ? ('<span>更新于 ' + escapeHtml(formatMemoryDate(targetChat.summaryUpdatedAt)) + '</span>') : '') +
+          '</div>' +
+          '<div class="aiw-rm-summary-text">' +
+            (targetChat.summary
+              ? escapeHtml(targetChat.summary)
+              : '尚未触发阶段性摘要（当前对话超过 ' + escapeHtml(String(ms.summaryTriggerChars || 3200)) + ' 字或保留条数上限时自动压缩）。') +
+          '</div>' +
+        '</div>'
+      );
+
+    var messagesHtml = !unsummarized.length
+      ? '<div class="aiw-mem-empty"><div class="aiw-mem-empty-title">暂无近期消息</div><div class="aiw-mem-empty-sub">在对话中发送消息后，这里会展示短期上下文保留的近期对话内容。</div></div>'
+      : unsummarized.slice().reverse().map(function(m, revIdx) {
+          var origIdx = unsummarized.length - 1 - revIdx;
+          var inWindow = origIdx >= activeStartIdx;
+          var roleText = m.role === 'user' ? '用户' : '知屿';
+          var timeText = formatMemoryDate(m.createdAt);
+          return (
+            '<div class="aiw-mem-card aiw-rm-msg-card">' +
+              '<div class="aiw-mem-card-top">' +
+                '<div class="aiw-mem-badges">' +
+                  '<span class="aiw-mem-badge ' + (m.role === 'user' ? 'is-cat' : 'is-scope') + '">' + roleText + '</span>' +
+                  '<span class="aiw-mem-badge ' + (inWindow ? 'is-active-win' : '') + '">' + (inWindow ? '将直接注入近期上下文' : '待下次摘要压缩') + '</span>' +
+                '</div>' +
+                (timeText ? '<span class="aiw-mem-time">' + escapeHtml(timeText) + '</span>' : '') +
+              '</div>' +
+              '<div class="aiw-mem-content">' + escapeHtml(String(m.content || '').slice(0, 600)) + '</div>' +
+              '<div class="aiw-mem-meta"><span class="aiw-mem-source">来源对话：' + escapeHtml((targetChat && targetChat.title) || '新对话') + '</span></div>' +
+            '</div>'
+          );
+        }).join('');
+
+    return (
+      '<div class="aiw-st-topbar">' +
+        '<button type="button" class="aiw-circle-btn" id="aiw-st-sub-back" aria-label="返回记忆设置">' +
+          '<i class="fa-solid fa-arrow-left"></i>' +
+        '</button>' +
+        '<div class="aiw-st-topbar-title">近期记忆</div>' +
+        '<div class="aiw-st-topbar-spacer"></div>' +
+      '</div>' +
+
+      '<div class="aiw-st-scroll">' +
+        '<div class="aiw-rm-notice">' +
+          '<i class="fa-solid fa-circle-info"></i>' +
+          '<span>近期记忆 ≠ 永久长期记忆。此处仅保存当前对话的短期上下文（近期原始消息与阶段性摘要），不会自动沉淀为跨窗口永久记忆。</span>' +
+        '</div>' +
+
+        '<div class="aiw-st-card">' +
+          '<div class="aiw-st-row aiw-st-row-static">' +
+            '<div class="aiw-st-row-col">' +
+              '<div class="aiw-st-row-label">启用短期上下文</div>' +
+              '<div class="aiw-st-row-desc">同步控制知屿当前对话是否保留近期消息与阶段性摘要</div>' +
+            '</div>' +
+            '<label class="aiw-switch">' +
+              '<input type="checkbox" id="aiw-rm-short-toggle"' + (ms.shortTermContext !== false ? ' checked' : '') + '>' +
+              '<span class="aiw-switch-track"></span>' +
+            '</label>' +
+          '</div>' +
+        '</div>' +
+
+        selectorHtml +
+
+        '<div class="aiw-st-group-title" style="margin-top:16px;">短期工作记忆概览</div>' +
+        '<div class="aiw-st-card aiw-st-pad">' + summaryBodyHtml + '</div>' +
+
+        '<div class="aiw-st-group-title" style="margin-top:16px;">近期消息明细</div>' +
+        '<div class="aiw-mem-list">' + messagesHtml + '</div>' +
+      '</div>'
+    );
+  }
+
+  function bindRecentMemoryEvents(layer) {
+    var shortToggle = layer.querySelector('#aiw-rm-short-toggle');
+    if (shortToggle) {
+      shortToggle.addEventListener('change', async function() {
+        _ctx.memorySettings = await S().saveMemorySettings({ shortTermContext: shortToggle.checked });
+        notifyWorkspaceStateChanged();
+        notifyToast(shortToggle.checked ? '已开启短期上下文' : '已关闭短期上下文');
+      });
+    }
+
+    var chatSelect = layer.querySelector('#aiw-rm-chat-select');
+    if (chatSelect) {
+      chatSelect.addEventListener('change', function() {
+        _ctx.recentSelectedChatId = chatSelect.value;
+        renderCurrentView();
+      });
+    }
+  }
+
+  function openMemoryEditorModal(layer, existingMem) {
+    var isEdit = !!(existingMem && existingMem.id);
+    var categories = (S() && S().MEMORY_CATEGORIES) || ['偏好', '习惯', '长期计划', '项目', '决定', '备忘', '身份信息'];
+    var draftCat = (existingMem && existingMem.category) || '偏好';
+    var draftScope = (existingMem && existingMem.scope) || 'user';
+    var draftImp = (existingMem && existingMem.importance) || 3;
+    var maxSingleLen = (_ctx.memorySettings && _ctx.memorySettings.maxSingleMemoryLength) || 260;
+
+    var catChips = categories.map(function(cat) {
+      return '<button type="button" class="aiw-chip-btn' + (cat === draftCat ? ' active' : '') + '" data-mem-cat="' + escapeHtml(cat) + '">' + escapeHtml(cat) + '</button>';
+    }).join('');
+
+    var scopeChoices = [
+      { id: 'user', label: '跨窗口共享' },
+      { id: 'chat', label: '仅当前对话' }
+    ];
+    if (draftScope === 'project') {
+      scopeChoices.push({ id: 'project', label: '项目记忆' });
+    }
+    var scopeSegs = scopeChoices.map(function(sc) {
+      return '<button type="button" class="aiw-seg-btn' + (sc.id === draftScope ? ' active' : '') + '" data-mem-scope="' + sc.id + '">' + sc.label + '</button>';
+    }).join('');
+
+    var impBtns = [1, 2, 3, 4, 5].map(function(num) {
+      return '<button type="button" class="aiw-seg-btn' + (num === draftImp ? ' active' : '') + '" data-mem-imp="' + num + '">' + num + '</button>';
+    }).join('');
+
+    var bodyHtml =
+      '<label class="aiw-field-label" for="aiw-mem-ed-content">记忆内容 *</label>' +
+      '<textarea class="aiw-field-textarea" id="aiw-mem-ed-content" rows="4" maxlength="' + escapeHtml(String(maxSingleLen)) + '" placeholder="例如：用户不喜欢香菜，点外卖或推荐食谱时请避开">' + escapeHtml(existingMem ? existingMem.content : '') + '</textarea>' +
+      '<label class="aiw-field-label" style="margin-top:12px;">记忆分类</label>' +
+      '<div class="aiw-chip-grid">' + catChips + '</div>' +
+      '<label class="aiw-field-label" style="margin-top:12px;">适用范围</label>' +
+      '<div class="aiw-seg-control">' + scopeSegs + '</div>' +
+      '<label class="aiw-field-label" style="margin-top:12px;">重要程度（1-5）</label>' +
+      '<div class="aiw-seg-control">' + impBtns + '</div>';
+
+    var footerHtml =
+      '<button type="button" class="aiw-st-btn-secondary" id="aiw-mem-ed-cancel">取消</button>' +
+      '<button type="button" class="aiw-st-btn-primary" id="aiw-mem-ed-save">' + (isEdit ? '保存修改' : '添加记忆') + '</button>';
+
+    var modal = showCustomModal(isEdit ? '编辑长期记忆' : '新增长期记忆', bodyHtml, footerHtml);
+    if (!modal) return;
+
+    modal.querySelectorAll('[data-mem-cat]').forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        draftCat = btn.getAttribute('data-mem-cat');
+        modal.querySelectorAll('[data-mem-cat]').forEach(function(b) {
+          b.classList.toggle('active', b === btn);
+        });
+      });
+    });
+
+    modal.querySelectorAll('[data-mem-scope]').forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        draftScope = btn.getAttribute('data-mem-scope');
+        modal.querySelectorAll('[data-mem-scope]').forEach(function(b) {
+          b.classList.toggle('active', b === btn);
+        });
+      });
+    });
+
+    modal.querySelectorAll('[data-mem-imp]').forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        draftImp = Number(btn.getAttribute('data-mem-imp')) || 3;
+        modal.querySelectorAll('[data-mem-imp]').forEach(function(b) {
+          b.classList.toggle('active', b === btn);
+        });
+      });
+    });
+
+    modal.querySelector('#aiw-mem-ed-cancel').addEventListener('click', closeModalOverlay);
+    modal.querySelector('#aiw-mem-ed-save').addEventListener('click', async function() {
+      var content = modal.querySelector('#aiw-mem-ed-content').value.trim();
+      if (!content) {
+        notifyToast('请输入记忆内容');
+        return;
+      }
+      if (M() && typeof M().containsSensitiveSecret === 'function' && M().containsSensitiveSecret(content)) {
+        notifyToast('为了安全，长期记忆不支持保存密码、API Key 或验证码等敏感信息');
+        return;
+      }
+      if (isEdit) {
+        await S().updateMemory(existingMem.id, {
+          content: content,
+          category: draftCat,
+          scope: draftScope,
+          importance: draftImp
+        });
+        notifyToast('记忆已更新');
+      } else {
+        if (typeof S().removeDeletedMemorySignatureByContent === 'function') {
+          await S().removeDeletedMemorySignatureByContent(content);
+        }
+        await S().createMemory({
+          content: content,
+          category: draftCat,
+          scope: draftScope,
+          importance: draftImp,
+          sourceChatTitle: '手动添加'
+        });
+        notifyToast('已添加长期记忆');
+      }
+      _ctx.memories = await S().listMemories();
+      closeModalOverlay();
+      notifyWorkspaceStateChanged();
+      renderCurrentView();
+    });
+  }
+
+  function bindMemoryListItemEvents(layer) {
+    layer.querySelectorAll('[data-mem-act]').forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        var act = btn.getAttribute('data-mem-act');
+        var id = btn.getAttribute('data-mem-id');
+        var mem = (_ctx.memories || []).find(function(m) { return m.id === id; });
+        if (!mem) return;
+
+        if (act === 'edit') {
+          openMemoryEditorModal(layer, mem);
+        } else if (act === 'delete') {
+          showConfirmModal(
+            '删除长期记忆',
+            '确定要删除这条记忆吗？删除后将立即停止在对话中检索使用。',
+            '确认删除',
+            true,
+            async function() {
+              await S().deleteMemory(id);
+              _ctx.memories = await S().listMemories();
+              notifyWorkspaceStateChanged();
+              renderCurrentView();
+              notifyToast('记忆已删除');
+            }
+          );
+        }
+      });
+    });
+  }
+
+  function bindMemoryTaskActions(layer) {
+    var retryTasksBtn = layer.querySelector('#aiw-mem-retry-tasks');
+    var clearTasksBtn = layer.querySelector('#aiw-mem-clear-tasks');
+
+    if (retryTasksBtn) {
+      retryTasksBtn.addEventListener('click', async function() {
+        if (!M() || typeof M().retryFailedMemoryTasks !== 'function') return;
+        retryTasksBtn.disabled = true;
+        retryTasksBtn.textContent = '重试中...';
+        try {
+          var res = await M().retryFailedMemoryTasks(_ctx.effectiveApi);
+          _ctx.memories = await S().listMemories();
+          _ctx.memoryTasks = await S().listMemoryTasks();
+          notifyWorkspaceStateChanged();
+          renderCurrentView();
+          var savedTotal = (res.addedCount || 0) + (res.updatedCount || 0);
+          if (res.failedTasks && res.failedTasks.length) {
+            notifyToast('仍有 ' + res.failedTasks.length + ' 条任务失败，请检查 API 配置或网络');
+          } else {
+            notifyToast(savedTotal ? ('重试成功，已写入 ' + savedTotal + ' 条记忆') : '失败任务已重试完成');
+          }
+        } catch (err) {
+          notifyToast((err && err.message) || '重试失败');
+          renderCurrentView();
+        }
+      });
+    }
+
+    if (clearTasksBtn) {
+      clearTasksBtn.addEventListener('click', async function() {
+        if (typeof S().clearFinishedMemoryTasks === 'function') {
+          _ctx.memoryTasks = await S().clearFinishedMemoryTasks();
+          renderCurrentView();
+          notifyToast('已清理已完成记录');
+        }
+      });
+    }
+  }
+
+  function bindMemoryPageEvents(layer) {
+    var openRecentBtn = layer.querySelector('#aiw-mem-open-recent');
+    var shortToggle = layer.querySelector('#aiw-mem-short-toggle');
+    var crossToggle = layer.querySelector('#aiw-mem-cross-toggle');
+    var useToggle = layer.querySelector('#aiw-mem-use-toggle');
+    var autoToggle = layer.querySelector('#aiw-mem-auto-toggle');
+    var refHistoryToggle = layer.querySelector('#aiw-mem-ref-history-toggle');
+    var advToggle = layer.querySelector('#aiw-mem-adv-toggle');
+    var advSaveBtn = layer.querySelector('#aiw-mem-adv-save');
+    var advResetBtn = layer.querySelector('#aiw-mem-adv-reset');
+    var searchInput = layer.querySelector('#aiw-mem-search');
+    var addBtn = layer.querySelector('#aiw-mem-add-btn');
+    var clearAllBtn = layer.querySelector('#aiw-mem-clear-all');
+
+    if (openRecentBtn) {
+      openRecentBtn.addEventListener('click', function() {
+        pushView('recent-memory');
+      });
+    }
+
+    if (shortToggle) {
+      shortToggle.addEventListener('change', async function() {
+        _ctx.memorySettings = await S().saveMemorySettings({ shortTermContext: shortToggle.checked });
+        notifyWorkspaceStateChanged();
+        notifyToast(shortToggle.checked ? '已开启短期上下文' : '已关闭短期上下文');
+      });
+    }
+
+    if (crossToggle) {
+      crossToggle.addEventListener('change', async function() {
+        _ctx.memorySettings = await S().saveMemorySettings({ crossChatMemory: crossToggle.checked });
+        notifyWorkspaceStateChanged();
+        notifyToast(crossToggle.checked ? '已开启跨窗口记忆' : '已关闭跨窗口记忆');
+      });
+    }
+
+    useToggle.addEventListener('change', async function() {
+      _ctx.memorySettings = await S().saveMemorySettings({ useMemory: useToggle.checked });
+      notifyWorkspaceStateChanged();
+      notifyToast(useToggle.checked ? '已开启长期记忆' : '已关闭长期记忆');
+    });
+
+    autoToggle.addEventListener('change', async function() {
+      _ctx.memorySettings = await S().saveMemorySettings({ autoMemory: autoToggle.checked });
+      notifyWorkspaceStateChanged();
+      notifyToast(autoToggle.checked ? '已开启自动记忆提取' : '已关闭自动记忆提取');
+    });
+
+    if (refHistoryToggle) {
+      refHistoryToggle.addEventListener('change', async function() {
+        _ctx.memorySettings = await S().saveMemorySettings({ referenceHistoryChats: refHistoryToggle.checked });
+        notifyWorkspaceStateChanged();
+        notifyToast(refHistoryToggle.checked ? '已开启参考历史聊天' : '已关闭参考历史聊天');
+      });
+    }
+
+    layer.querySelectorAll('[data-mem-strategy]').forEach(function(btn) {
+      btn.addEventListener('click', async function() {
+        var stId = btn.getAttribute('data-mem-strategy');
+        if (typeof S().applyMemoryStrategy === 'function') {
+          _ctx.memorySettings = await S().applyMemoryStrategy(stId);
+        } else {
+          _ctx.memorySettings = await S().saveMemorySettings({ strategy: stId });
+        }
+        notifyWorkspaceStateChanged();
+        renderCurrentView();
+        var presets = S().MEMORY_STRATEGY_PRESETS || {};
+        notifyToast('已切换策略：' + ((presets[stId] && presets[stId].label) || stId));
+      });
+    });
+
+    if (advToggle) {
+      advToggle.addEventListener('click', function() {
+        _ctx.advancedMemoryOpen = !_ctx.advancedMemoryOpen;
+        var body = layer.querySelector('#aiw-mem-adv-body');
+        var arrowIcon = advToggle.querySelector('.aiw-st-row-arrow i');
+        if (body) body.hidden = !_ctx.advancedMemoryOpen;
+        if (arrowIcon) arrowIcon.className = 'fa-solid fa-angle-' + (_ctx.advancedMemoryOpen ? 'up' : 'down');
+      });
+    }
+
+    if (advSaveBtn) {
+      advSaveBtn.addEventListener('click', async function() {
+        var bounds = S().MEMORY_SETTING_BOUNDS || {};
+        var rawTrigger = Number(layer.querySelector('#aiw-adv-trigger-chars').value);
+        var rawRecent = Number(layer.querySelector('#aiw-adv-recent-limit').value);
+        var rawRecall = Number(layer.querySelector('#aiw-adv-recall-count').value);
+        var rawMaxLen = Number(layer.querySelector('#aiw-adv-mem-len').value);
+
+        if (!Number.isFinite(rawTrigger) || !Number.isFinite(rawRecent) || !Number.isFinite(rawRecall) || !Number.isFinite(rawMaxLen)) {
+          notifyToast('请输入有效的数字参数');
+          return;
+        }
+        var outOfRange =
+          (bounds.summaryTriggerChars && (rawTrigger < bounds.summaryTriggerChars.min || rawTrigger > bounds.summaryTriggerChars.max)) ||
+          (bounds.recentRawMessagesLimit && (rawRecent < bounds.recentRawMessagesLimit.min || rawRecent > bounds.recentRawMessagesLimit.max)) ||
+          (bounds.maxMemoryRecallCount && (rawRecall < bounds.maxMemoryRecallCount.min || rawRecall > bounds.maxMemoryRecallCount.max)) ||
+          (bounds.maxSingleMemoryLength && (rawMaxLen < bounds.maxSingleMemoryLength.min || rawMaxLen > bounds.maxSingleMemoryLength.max));
+
+        _ctx.memorySettings = await S().saveMemorySettings({
+          summaryTriggerChars: rawTrigger,
+          recentRawMessagesLimit: rawRecent,
+          maxMemoryRecallCount: rawRecall,
+          maxSingleMemoryLength: rawMaxLen,
+          applyStrategyPreset: false
+        });
+        notifyWorkspaceStateChanged();
+        renderCurrentView();
+        notifyToast(outOfRange ? '部分参数超出安全范围，已自动修正并保存' : '高级记忆参数已保存');
+      });
+    }
+
+    if (advResetBtn) {
+      advResetBtn.addEventListener('click', async function() {
+        if (typeof S().resetMemorySettingsToDefaults === 'function') {
+          _ctx.memorySettings = await S().resetMemorySettingsToDefaults();
+        } else {
+          _ctx.memorySettings = await S().saveMemorySettings(S().DEFAULT_MEMORY_SETTINGS || {});
+        }
+        notifyWorkspaceStateChanged();
+        renderCurrentView();
+        notifyToast('已恢复默认记忆设置');
+      });
+    }
+
+    searchInput.addEventListener('input', function() {
+      _ctx.memorySearchQuery = searchInput.value || '';
+      var filtered = getFilteredMemories();
+      var listEl = layer.querySelector('#aiw-mem-list');
+      var countEl = layer.querySelector('#aiw-mem-count-text');
+      if (listEl) listEl.innerHTML = renderMemoryCardsHtml(filtered);
+      if (countEl) {
+        countEl.textContent = '共 ' + (_ctx.memories || []).length + ' 条长期记忆' + (_ctx.memorySearchQuery ? ('（筛选出 ' + filtered.length + ' 条）') : '');
+      }
+      bindMemoryListItemEvents(layer);
+    });
+
+    addBtn.addEventListener('click', function() {
+      openMemoryEditorModal(layer, null);
+    });
+
+    clearAllBtn.addEventListener('click', function() {
+      if (!(_ctx.memories || []).length) return;
+      showConfirmModal(
+        '清空全部长期记忆',
+        '确定要清空知屿保存的全部 ' + _ctx.memories.length + ' 条长期记忆吗？此操作不可恢复。',
+        '确认清空',
+        true,
+        async function() {
+          await S().clearAllMemories();
+          _ctx.memories = [];
+          _ctx.memorySearchQuery = '';
+          notifyWorkspaceStateChanged();
+          renderCurrentView();
+          notifyToast('已清空全部长期记忆');
+        }
+      );
+    });
+
+    bindMemoryTaskActions(layer);
+    bindMemoryListItemEvents(layer);
   }
 
   // ===== 导航栈管理 =====
@@ -1576,6 +2449,12 @@
     } else if (view === 'preset-editor') {
       layer.innerHTML = renderPresetEditorHtml();
       bindPresetEditorEvents(layer);
+    } else if (view === 'memory') {
+      layer.innerHTML = renderMemoryPageHtml();
+      bindMemoryPageEvents(layer);
+    } else if (view === 'recent-memory') {
+      layer.innerHTML = renderRecentMemoryHtml();
+      bindRecentMemoryEvents(layer);
     } else if (view === 'general') {
       layer.innerHTML = renderGeneralHtml();
       bindGeneralEvents(layer);
@@ -1610,13 +2489,7 @@
     layer.querySelectorAll('[data-st-action]').forEach(function(btn) {
       btn.addEventListener('click', function() {
         var act = btn.getAttribute('data-st-action');
-        if (act === 'memory-entry') {
-          showCustomModal(
-            '记忆',
-            '<p class="aiw-st-modal-msg">「记忆」入口已预留，长期记忆存储与检索将在后续阶段正式接入。</p>',
-            '<button type="button" class="aiw-st-btn-primary" id="aiw-placeholder-ok">我知道了</button>'
-          );
-        } else if (act === 'plugins-entry') {
+        if (act === 'plugins-entry') {
           showCustomModal(
             '插件',
             '<p class="aiw-st-modal-msg">「插件」入口已预留，插件调用与扩展能力将在后续阶段正式接入。</p>',
@@ -1635,10 +2508,12 @@
     if (accRow) accRow.addEventListener('click', openAccentPickerModal);
   }
 
-  async function openSettingsCenter(pageEl, initialView, onStateChanged) {
+  async function openSettingsCenter(pageEl, initialView, onStateChanged, options) {
     if (!pageEl || !S()) return;
     _ctx.page = pageEl;
     _ctx.onStateChanged = onStateChanged || null;
+    _ctx.activeChatId = (options && options.activeChatId) || '';
+    _ctx.recentSelectedChatId = _ctx.activeChatId || '';
 
     var layer = getLayer();
     if (!layer) {
@@ -1658,8 +2533,50 @@
     });
   }
 
+  async function refreshMemoryViewsIfOpen() {
+    var layer = getLayer();
+    if (!layer || !layer.classList.contains('open') || !S()) return;
+    var view = _ctx.viewStack[_ctx.viewStack.length - 1] || '';
+    if (view !== 'memory' && view !== 'recent-memory' && view !== 'home') return;
+
+    var results = await Promise.all([
+      typeof S().listMemories === 'function' ? S().listMemories() : Promise.resolve([]),
+      typeof S().listMemoryTasks === 'function' ? S().listMemoryTasks() : Promise.resolve([]),
+      typeof S().listChats === 'function' ? S().listChats() : Promise.resolve([]),
+      typeof S().getMemorySettings === 'function' ? S().getMemorySettings() : Promise.resolve(_ctx.memorySettings)
+    ]);
+    _ctx.memories = results[0] || [];
+    _ctx.memoryTasks = results[1] || [];
+    _ctx.chats = results[2] || [];
+    _ctx.memorySettings = results[3] || _ctx.memorySettings;
+
+    if (view === 'memory') {
+      if (layer.querySelector('.aiw-st-modal-backdrop')) return;
+      var filtered = getFilteredMemories();
+      var listEl = layer.querySelector('#aiw-mem-list');
+      var countEl = layer.querySelector('#aiw-mem-count-text');
+      var clearBtn = layer.querySelector('#aiw-mem-clear-all');
+      var taskSection = layer.querySelector('#aiw-mem-task-section');
+      if (listEl) {
+        listEl.innerHTML = renderMemoryCardsHtml(filtered);
+        bindMemoryListItemEvents(layer);
+      }
+      if (countEl) {
+        countEl.textContent = '共 ' + _ctx.memories.length + ' 条长期记忆' + (_ctx.memorySearchQuery ? ('（筛选出 ' + filtered.length + ' 条）') : '');
+      }
+      if (clearBtn) clearBtn.disabled = !_ctx.memories.length;
+      if (taskSection) {
+        taskSection.outerHTML = renderMemoryTasksHtml(_ctx.memoryTasks);
+        bindMemoryTaskActions(layer);
+      }
+    } else if (!layer.querySelector('.aiw-st-modal-backdrop')) {
+      renderCurrentView();
+    }
+  }
+
   global.AiWorkspaceSettings = {
     openSettingsCenter: openSettingsCenter,
-    closeSettingsCenter: closeLayer
+    closeSettingsCenter: closeLayer,
+    refreshMemoryViewsIfOpen: refreshMemoryViewsIfOpen
   };
 })(window);
