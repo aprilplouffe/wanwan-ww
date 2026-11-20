@@ -1,5 +1,5 @@
-// ai-workspace-storage.js — 知屿（AI 工作空间）第三阶段：配置与预设持久化存储层
-// 严格复用现有 WanWanDB 的 db.config 键值表（不修改 db.js 数据库版本，不影响现有业务表），并辅以 localStorage 兜底镜像。
+// ai-workspace-storage.js — 知屿（AI 工作空间）持久化存储层（配置、预设、专属 API 与独立聊天记录）
+// 严格复用现有 WanWanDB 的 db.config 键值表（不修改 db.js 数据库版本，不混入微信 db.chats/db.messages），并辅以 localStorage 兜底镜像。
 (function(global) {
   'use strict';
 
@@ -13,7 +13,11 @@
     PRESET_IDS: 'aiw_preset_ids',
     PRESET_PREFIX: 'aiw_preset:',
     PRESETS_INIT: 'aiw_presets_initialized',
-    DEFAULT_PRESET_ID: 'aiw_default_preset_id'
+    DEFAULT_PRESET_ID: 'aiw_default_preset_id',
+    API_CONFIG: 'aiw_api_config',
+    SELECTED_MODEL: 'aiw_selected_model',
+    CHAT_IDS: 'aiw_chat_ids',
+    CHAT_PREFIX: 'aiw_chat:'
   };
 
   var ACCENT_PRESETS = [
@@ -532,9 +536,272 @@
     };
   }
 
+  // ===== 7. 知屿专属 API 配置（与弯弯机主 API 完全隔离，不写入 apiBaseUrl/apiKey/apiModel） =====
+  function normalizeBaseUrl(url) {
+    return String(url == null ? '' : url).trim().replace(/\/+$/, '');
+  }
+
+  function normalizeTemperature(val, fallback) {
+    var num = Number(val);
+    if (!Number.isFinite(num)) return typeof fallback === 'number' ? fallback : 0.7;
+    if (num < 0) num = 0;
+    if (num > 2) num = 2;
+    return Math.round(num * 100) / 100;
+  }
+
+  function isCustomApiComplete(cfg) {
+    if (!cfg || typeof cfg !== 'object') return false;
+    return !!(
+      normalizeBaseUrl(cfg.baseUrl || cfg.url) &&
+      String(cfg.apiKey || cfg.key || '').trim() &&
+      String(cfg.model || '').trim()
+    );
+  }
+
+  async function getCustomApiConfig() {
+    var saved = await dbGetConfig(KEYS.API_CONFIG);
+    var src = saved && typeof saved === 'object' ? saved : {};
+    var normalized = {
+      baseUrl: normalizeBaseUrl(src.baseUrl || src.url || ''),
+      apiKey: String(src.apiKey || src.key || '').trim(),
+      model: String(src.model || '').trim(),
+      fetchedModels: Array.isArray(src.fetchedModels) ? src.fetchedModels.filter(Boolean).map(String) : [],
+      temperature: normalizeTemperature(src.temperature, 0.7),
+      updatedAt: Number(src.updatedAt) || 0
+    };
+    normalized.complete = isCustomApiComplete(normalized);
+    return normalized;
+  }
+
+  async function saveCustomApiConfig(patch) {
+    var current = await getCustomApiConfig();
+    var p = patch && typeof patch === 'object' ? patch : {};
+    var next = {
+      baseUrl: p.baseUrl !== undefined ? normalizeBaseUrl(p.baseUrl) : current.baseUrl,
+      apiKey: p.apiKey !== undefined ? String(p.apiKey || '').trim() : current.apiKey,
+      model: p.model !== undefined ? String(p.model || '').trim() : current.model,
+      fetchedModels: Array.isArray(p.fetchedModels)
+        ? p.fetchedModels.filter(Boolean).map(String)
+        : current.fetchedModels,
+      temperature: p.temperature !== undefined
+        ? normalizeTemperature(p.temperature, 0.7)
+        : current.temperature,
+      updatedAt: Date.now()
+    };
+    next.complete = isCustomApiComplete(next);
+    await dbPutConfig(KEYS.API_CONFIG, next);
+    return next;
+  }
+
+  async function clearCustomApiConfig() {
+    var empty = {
+      baseUrl: '',
+      apiKey: '',
+      model: '',
+      fetchedModels: [],
+      temperature: 0.7,
+      updatedAt: Date.now(),
+      complete: false
+    };
+    await dbDeleteConfig(KEYS.API_CONFIG);
+    return empty;
+  }
+
+  // ===== 8. 知屿记住的模型选择（仅作用于知屿，不影响其他应用） =====
+  async function getSelectedModel() {
+    var saved = await dbGetConfig(KEYS.SELECTED_MODEL);
+    if (saved && typeof saved === 'object') {
+      return String(saved.model || '').trim();
+    }
+    return typeof saved === 'string' ? saved.trim() : '';
+  }
+
+  async function saveSelectedModel(modelName) {
+    var clean = String(modelName || '').trim();
+    await dbPutConfig(KEYS.SELECTED_MODEL, {
+      model: clean,
+      updatedAt: Date.now()
+    });
+    return clean;
+  }
+
+  // ===== 9. 独立聊天历史记录（存储于 aiw_chat_ids / aiw_chat:<id>，绝不混入 db.chats/db.messages） =====
+  function generateChatId() {
+    return 'chat_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7);
+  }
+
+  function generateMessageId() {
+    return 'msg_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7);
+  }
+
+  function buildPresetSnapshot(preset) {
+    if (!preset || typeof preset !== 'object') return null;
+    return {
+      id: String(preset.id || ''),
+      name: String(preset.name || '未命名预设'),
+      avatarType: preset.avatarType === 'image' ? 'image' : 'icon',
+      avatarValue: String(preset.avatarValue || 'fa-solid fa-wand-magic-sparkles'),
+      description: String(preset.description || ''),
+      systemPrompt: String(preset.systemPrompt || ''),
+      replyStyle: String(preset.replyStyle || '温和自然'),
+      detailLevel: ['精简', '适中', '详尽'].indexOf(preset.detailLevel) !== -1 ? preset.detailLevel : '适中',
+      capturedAt: Number(preset.capturedAt) || Date.now()
+    };
+  }
+
+  function generateChatTitle(firstText) {
+    var clean = String(firstText || '')
+      .replace(/\r?\n+/g, ' ')
+      .replace(/^[#>*`\-\s]+/, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (!clean) return '新对话';
+    if (clean.length <= 22) return clean;
+    return clean.slice(0, 22) + '…';
+  }
+
+  function normalizeChatMessage(raw) {
+    var src = raw && typeof raw === 'object' ? raw : {};
+    var role = src.role === 'assistant' || src.role === 'system' ? src.role : 'user';
+    return {
+      id: String(src.id || generateMessageId()),
+      role: role,
+      content: String(src.content == null ? '' : src.content),
+      createdAt: Number(src.createdAt) || Date.now(),
+      model: src.model ? String(src.model) : '',
+      error: src.error ? String(src.error) : '',
+      aborted: !!src.aborted,
+      deepThink: !!src.deepThink
+    };
+  }
+
+  function normalizeChatRecord(raw, forcedId) {
+    var now = Date.now();
+    var src = raw && typeof raw === 'object' ? raw : {};
+    var msgs = Array.isArray(src.messages) ? src.messages.map(normalizeChatMessage) : [];
+    return {
+      id: String(forcedId || src.id || generateChatId()),
+      title: String(src.title || '新对话').trim() || '新对话',
+      pinned: !!src.pinned,
+      messages: msgs,
+      createdAt: Number(src.createdAt) || now,
+      updatedAt: Number(src.updatedAt) || now,
+      model: String(src.model || '').trim(),
+      presetId: String(src.presetId || '').trim(),
+      presetSnapshot: src.presetSnapshot ? buildPresetSnapshot(src.presetSnapshot) : null
+    };
+  }
+
+  async function listChats() {
+    var ids = await dbGetConfig(KEYS.CHAT_IDS);
+    if (!Array.isArray(ids)) ids = [];
+    var items = [];
+    for (var i = 0; i < ids.length; i++) {
+      var id = ids[i];
+      var raw = await dbGetConfig(KEYS.CHAT_PREFIX + id);
+      if (raw && typeof raw === 'object') {
+        items.push(normalizeChatRecord(raw, id));
+      }
+    }
+    items.sort(function(a, b) {
+      if (!!a.pinned !== !!b.pinned) return a.pinned ? -1 : 1;
+      return (b.updatedAt || 0) - (a.updatedAt || 0);
+    });
+    return items;
+  }
+
+  async function getChat(id) {
+    if (!id) return null;
+    var raw = await dbGetConfig(KEYS.CHAT_PREFIX + id);
+    if (!raw || typeof raw !== 'object') return null;
+    return normalizeChatRecord(raw, id);
+  }
+
+  async function createChat(data) {
+    var ids = await dbGetConfig(KEYS.CHAT_IDS);
+    if (!Array.isArray(ids)) ids = [];
+    var now = Date.now();
+    var src = data && typeof data === 'object' ? data : {};
+    var chat = normalizeChatRecord(Object.assign({}, src, {
+      id: src.id || generateChatId(),
+      createdAt: now,
+      updatedAt: now
+    }));
+    await dbPutConfig(KEYS.CHAT_PREFIX + chat.id, chat);
+    if (ids.indexOf(chat.id) === -1) {
+      ids.unshift(chat.id);
+      await dbPutConfig(KEYS.CHAT_IDS, ids);
+    }
+    return chat;
+  }
+
+  async function saveChat(chatData) {
+    if (!chatData || !chatData.id) {
+      return await createChat(chatData || {});
+    }
+    var existing = await getChat(chatData.id);
+    if (!existing) {
+      return await createChat(chatData);
+    }
+    var updated = normalizeChatRecord(Object.assign({}, existing, chatData, {
+      id: existing.id,
+      createdAt: existing.createdAt,
+      updatedAt: Number(chatData.updatedAt) || Date.now()
+    }), existing.id);
+    await dbPutConfig(KEYS.CHAT_PREFIX + updated.id, updated);
+    return updated;
+  }
+
+  async function renameChat(id, title) {
+    var cleanTitle = String(title || '').trim();
+    if (!id || !cleanTitle) return null;
+    var chat = await getChat(id);
+    if (!chat) return null;
+    chat.title = cleanTitle.slice(0, 80);
+    chat.updatedAt = Date.now();
+    return await saveChat(chat);
+  }
+
+  async function togglePinChat(id) {
+    if (!id) return null;
+    var chat = await getChat(id);
+    if (!chat) return null;
+    chat.pinned = !chat.pinned;
+    chat.updatedAt = Date.now();
+    return await saveChat(chat);
+  }
+
+  async function deleteChat(id) {
+    if (!id) return false;
+    var ids = await dbGetConfig(KEYS.CHAT_IDS);
+    if (!Array.isArray(ids)) ids = [];
+    var idx = ids.indexOf(id);
+    if (idx !== -1) {
+      ids.splice(idx, 1);
+      await dbPutConfig(KEYS.CHAT_IDS, ids);
+    }
+    await dbDeleteConfig(KEYS.CHAT_PREFIX + id);
+    return true;
+  }
+
+  async function searchChats(query) {
+    var list = await listChats();
+    var q = String(query || '').trim().toLowerCase();
+    if (!q) return list;
+    return list.filter(function(chat) {
+      if ((chat.title || '').toLowerCase().indexOf(q) !== -1) return true;
+      return (chat.messages || []).some(function(m) {
+        return String(m.content || '').toLowerCase().indexOf(q) !== -1;
+      });
+    });
+  }
+
   global.AiWorkspaceStorage = {
     KEYS: KEYS,
     ACCENT_PRESETS: ACCENT_PRESETS,
+    normalizeBaseUrl: normalizeBaseUrl,
+    normalizeTemperature: normalizeTemperature,
+    isCustomApiComplete: isCustomApiComplete,
     getProfile: getProfile,
     saveProfile: saveProfile,
     getPersonalization: getPersonalization,
@@ -552,6 +819,22 @@
     duplicatePreset: duplicatePreset,
     deletePreset: deletePreset,
     buildPresetExportJson: buildPresetExportJson,
-    parseImportedPromptPayload: parseImportedPromptPayload
+    parseImportedPromptPayload: parseImportedPromptPayload,
+    getCustomApiConfig: getCustomApiConfig,
+    saveCustomApiConfig: saveCustomApiConfig,
+    clearCustomApiConfig: clearCustomApiConfig,
+    getSelectedModel: getSelectedModel,
+    saveSelectedModel: saveSelectedModel,
+    buildPresetSnapshot: buildPresetSnapshot,
+    generateChatTitle: generateChatTitle,
+    generateMessageId: generateMessageId,
+    listChats: listChats,
+    getChat: getChat,
+    createChat: createChat,
+    saveChat: saveChat,
+    renameChat: renameChat,
+    togglePinChat: togglePinChat,
+    deleteChat: deleteChat,
+    searchChats: searchChats
   };
-})(window);
+})(typeof window !== 'undefined' ? window : globalThis);

@@ -41,11 +41,17 @@
     personalization: null,
     appearance: null,
     general: null,
-    presets: []
+    presets: [],
+    customApi: null,
+    effectiveApi: null
   };
 
   function S() {
     return global.AiWorkspaceStorage;
+  }
+
+  function AI() {
+    return global.AiWorkspaceAI;
   }
 
   function escapeHtml(str) {
@@ -140,13 +146,18 @@
       store.getPersonalization(),
       store.getAppearance(),
       store.getGeneralSettings(),
-      store.listPresets()
+      store.listPresets(),
+      store.getCustomApiConfig()
     ]);
     _ctx.profile = results[0];
     _ctx.personalization = results[1];
     _ctx.appearance = results[2];
     _ctx.general = results[3];
     _ctx.presets = results[4];
+    _ctx.customApi = results[5];
+    if (AI() && typeof AI().resolveEffectiveApiConfig === 'function') {
+      _ctx.effectiveApi = await AI().resolveEffectiveApiConfig();
+    }
   }
 
   function notifyWorkspaceStateChanged() {
@@ -156,7 +167,9 @@
         appearance: _ctx.appearance,
         personalization: _ctx.personalization,
         general: _ctx.general,
-        presets: _ctx.presets
+        presets: _ctx.presets,
+        customApi: _ctx.customApi,
+        effectiveApi: _ctx.effectiveApi
       });
     }
   }
@@ -237,6 +250,10 @@
     var accentInfo = getAccentInfo(appearance.accent);
     var defaultPreset = (_ctx.presets || []).find(function(p) { return p.isDefault; }) || (_ctx.presets && _ctx.presets[0]);
     var presetSummary = defaultPreset ? defaultPreset.name : '未设置';
+    var customApi = _ctx.customApi || {};
+    var apiStatusVal = customApi.complete
+      ? ('专属 · ' + (customApi.model || '已配置'))
+      : '使用主 API';
 
     return (
       '<div class="aiw-st-topbar">' +
@@ -255,6 +272,16 @@
           '</div>' +
           '<div class="aiw-st-profile-name">' + escapeHtml(profile.name) + '</div>' +
           '<div class="aiw-st-profile-bio">' + escapeHtml(profile.bio || '本地工作空间') + '</div>' +
+        '</div>' +
+
+        '<div class="aiw-st-group-title">模型与接口</div>' +
+        '<div class="aiw-st-card">' +
+          '<button type="button" class="aiw-st-row" data-st-nav="custom-api">' +
+            '<span class="aiw-st-row-icon"><i class="fa-solid fa-plug"></i></span>' +
+            '<span class="aiw-st-row-label">知屿专属 API</span>' +
+            '<span class="aiw-st-row-val">' + escapeHtml(apiStatusVal) + '</span>' +
+            '<span class="aiw-st-row-arrow"><i class="fa-solid fa-angle-right"></i></span>' +
+          '</button>' +
         '</div>' +
 
         '<div class="aiw-st-group-title">我的知屿</div>' +
@@ -486,7 +513,7 @@
           '<div class="aiw-st-row aiw-st-row-static">' +
             '<div class="aiw-st-row-col">' +
               '<div class="aiw-st-row-label">启用个性化</div>' +
-              '<div class="aiw-st-row-desc">开启后将在后续阶段把自定义指令与偏好注入知屿对话</div>' +
+              '<div class="aiw-st-row-desc">开启后将在知屿对话中自动注入自定义指令与用户偏好</div>' +
             '</div>' +
             '<label class="aiw-switch">' +
               '<input type="checkbox" id="aiw-ps-enabled"' + (ps.enabled ? ' checked' : '') + '>' +
@@ -1239,6 +1266,281 @@
     });
   }
 
+  // ===== 视图 6：知屿专属 API 配置 =====
+  function formatTempReadout(val) {
+    var num = Number(val);
+    if (!Number.isFinite(num)) num = 0.7;
+    return num.toFixed(2).replace(/0+$/, '').replace(/\.$/, '');
+  }
+
+  function renderCustomApiHtml() {
+    var cfg = _ctx.customApi || { baseUrl: '', apiKey: '', model: '', fetchedModels: [], temperature: 0.7, complete: false };
+    var models = Array.isArray(cfg.fetchedModels) ? cfg.fetchedModels.slice() : [];
+    if (cfg.model && models.indexOf(cfg.model) === -1) {
+      models.unshift(cfg.model);
+    }
+    var hasPartial = !cfg.complete && !!(cfg.baseUrl || cfg.apiKey || cfg.model);
+    var statusBannerClass = cfg.complete ? 'is-custom' : (hasPartial ? 'is-partial' : 'is-primary');
+    var statusTitle = cfg.complete
+      ? '已启用知屿专属 API'
+      : (hasPartial ? '专属 API 未配置完整（当前回退主 API）' : '未配置专属 API（当前使用弯弯机主 API）');
+    var statusDesc = cfg.complete
+      ? '知屿将严格优先使用下方专属接口；若请求失败会明确报错，不会偷偷切换回主 API，也不影响弯弯机其他应用。'
+      : '只有 Base URL、API Key 与模型名称三项均填写完整后才会启用专属 API；留空或不完整时自动使用弯弯机现有主 API。';
+
+    var modelOptionsHtml = '<option value="">拉取后选择模型</option>' + models.map(function(m) {
+      var selected = cfg.model === m ? ' selected' : '';
+      return '<option value="' + escapeHtml(m) + '"' + selected + '>' + escapeHtml(m) + '</option>';
+    }).join('');
+
+    return (
+      '<div class="aiw-st-topbar">' +
+        '<button type="button" class="aiw-circle-btn" id="aiw-st-sub-back" aria-label="返回设置">' +
+          '<i class="fa-solid fa-arrow-left"></i>' +
+        '</button>' +
+        '<div class="aiw-st-topbar-title">知屿专属 API</div>' +
+        '<button type="button" class="aiw-st-top-action" id="aiw-api-save-top">保存</button>' +
+      '</div>' +
+
+      '<div class="aiw-st-scroll">' +
+        '<div class="aiw-api-status-banner ' + statusBannerClass + '" id="aiw-api-status-banner">' +
+          '<div class="aiw-api-status-title"><i class="fa-solid fa-circle-info"></i> ' + escapeHtml(statusTitle) + '</div>' +
+          '<div class="aiw-api-status-desc">' + escapeHtml(statusDesc) + '</div>' +
+        '</div>' +
+
+        '<div class="aiw-st-card aiw-st-pad">' +
+          '<label class="aiw-field-label" for="aiw-api-base-url">Base URL</label>' +
+          '<input type="url" class="aiw-field-input" id="aiw-api-base-url" autocomplete="off" spellcheck="false" value="' + escapeHtml(cfg.baseUrl || '') + '" placeholder="https://api.openai.com/v1">' +
+
+          '<label class="aiw-field-label" for="aiw-api-key" style="margin-top:14px;">API Key</label>' +
+          '<div class="aiw-api-key-row">' +
+            '<input type="password" class="aiw-field-input" id="aiw-api-key" autocomplete="off" spellcheck="false" value="' + escapeHtml(cfg.apiKey || '') + '" placeholder="sk-...">' +
+            '<button type="button" class="aiw-st-btn-secondary aiw-st-btn-sm" id="aiw-api-toggle-key">显示</button>' +
+          '</div>' +
+
+          '<label class="aiw-field-label" for="aiw-api-model-input" style="margin-top:14px;">模型名称（支持手动输入）</label>' +
+          '<input type="text" class="aiw-field-input" id="aiw-api-model-input" autocomplete="off" spellcheck="false" value="' + escapeHtml(cfg.model || '') + '" placeholder="手动输入模型名，例如 gpt-4o-mini">' +
+
+          '<label class="aiw-field-label" for="aiw-api-model-select" style="margin-top:14px;">拉取模型列表</label>' +
+          '<div class="aiw-api-model-row">' +
+            '<select class="aiw-field-input aiw-api-select" id="aiw-api-model-select">' + modelOptionsHtml + '</select>' +
+            '<button type="button" class="aiw-st-btn-secondary aiw-st-btn-sm" id="aiw-api-fetch-models">' +
+              '<i class="fa-solid fa-arrows-rotate"></i> 获取' +
+            '</button>' +
+          '</div>' +
+
+          '<div class="aiw-api-temp-block">' +
+            '<div class="aiw-field-head" style="margin-bottom:4px;">' +
+              '<label class="aiw-field-label" for="aiw-api-temp" style="margin:0;">温度调节（Temperature）</label>' +
+              '<span class="aiw-api-temp-val" id="aiw-api-temp-val">' + escapeHtml(formatTempReadout(cfg.temperature)) + '</span>' +
+            '</div>' +
+            '<input type="range" class="aiw-range-slider" id="aiw-api-temp" min="0" max="2" step="0.05" value="' + escapeHtml(String(cfg.temperature != null ? cfg.temperature : 0.7)) + '">' +
+            '<div class="aiw-api-temp-hints"><span>0.0 严谨稳定</span><span>1.0 均衡自然</span><span>2.0 发散创意</span></div>' +
+          '</div>' +
+
+          '<div class="aiw-api-actions-row">' +
+            '<button type="button" class="aiw-st-btn-secondary" id="aiw-api-test-btn">' +
+              '<i class="fa-solid fa-plug-circle-check"></i> 连接测试' +
+            '</button>' +
+            '<button type="button" class="aiw-st-btn-primary" id="aiw-api-save-btn">' +
+              '<i class="fa-solid fa-check"></i> 保存配置' +
+            '</button>' +
+          '</div>' +
+        '</div>' +
+
+        '<div class="aiw-st-bottom-bar">' +
+          '<button type="button" class="aiw-st-btn-secondary aiw-st-btn-block aiw-btn-text-danger" id="aiw-api-clear-btn">' +
+            '<i class="fa-regular fa-trash-can"></i> 清空知屿专属配置（切回主 API）' +
+          '</button>' +
+        '</div>' +
+
+        '<div class="aiw-st-footnote">说明：此处的 API 配置仅作用于「知屿」，绝不会写入或改动弯弯机主设置中的全局 API 与模型。</div>' +
+      '</div>'
+    );
+  }
+
+  function bindCustomApiEvents(layer) {
+    var urlInput = layer.querySelector('#aiw-api-base-url');
+    var keyInput = layer.querySelector('#aiw-api-key');
+    var toggleKeyBtn = layer.querySelector('#aiw-api-toggle-key');
+    var modelInput = layer.querySelector('#aiw-api-model-input');
+    var modelSelect = layer.querySelector('#aiw-api-model-select');
+    var fetchBtn = layer.querySelector('#aiw-api-fetch-models');
+    var tempSlider = layer.querySelector('#aiw-api-temp');
+    var tempValEl = layer.querySelector('#aiw-api-temp-val');
+    var testBtn = layer.querySelector('#aiw-api-test-btn');
+    var saveBtn = layer.querySelector('#aiw-api-save-btn');
+    var saveTopBtn = layer.querySelector('#aiw-api-save-top');
+    var clearBtn = layer.querySelector('#aiw-api-clear-btn');
+
+    var fetchedList = (_ctx.customApi && Array.isArray(_ctx.customApi.fetchedModels))
+      ? _ctx.customApi.fetchedModels.slice()
+      : [];
+
+    function readFormDraft() {
+      return {
+        baseUrl: S().normalizeBaseUrl(urlInput.value),
+        apiKey: String(keyInput.value || '').trim(),
+        model: String(modelInput.value || '').trim(),
+        temperature: S().normalizeTemperature(tempSlider.value, 0.7),
+        fetchedModels: fetchedList
+      };
+    }
+
+    function syncDropdownOptions(models, currentModel) {
+      var list = Array.isArray(models) ? models.slice() : [];
+      if (currentModel && list.indexOf(currentModel) === -1) {
+        list.unshift(currentModel);
+      }
+      modelSelect.innerHTML = '<option value="">拉取后选择模型</option>' + list.map(function(m) {
+        return '<option value="' + escapeHtml(m) + '">' + escapeHtml(m) + '</option>';
+      }).join('');
+      if (currentModel) {
+        modelSelect.value = currentModel;
+      }
+    }
+
+    toggleKeyBtn.addEventListener('click', function() {
+      var showing = keyInput.type === 'text';
+      keyInput.type = showing ? 'password' : 'text';
+      toggleKeyBtn.textContent = showing ? '显示' : '隐藏';
+    });
+
+    tempSlider.addEventListener('input', function() {
+      tempValEl.textContent = formatTempReadout(tempSlider.value);
+    });
+
+    modelSelect.addEventListener('change', function() {
+      if (modelSelect.value) {
+        modelInput.value = modelSelect.value;
+      }
+    });
+
+    modelInput.addEventListener('input', function() {
+      var v = modelInput.value.trim();
+      for (var i = 0; i < modelSelect.options.length; i++) {
+        if (modelSelect.options[i].value === v) {
+          modelSelect.value = v;
+          return;
+        }
+      }
+      modelSelect.value = '';
+    });
+
+    fetchBtn.addEventListener('click', async function() {
+      var draft = readFormDraft();
+      if (!AI() || typeof AI().fetchModels !== 'function') {
+        notifyToast('AI 引擎模块未就绪');
+        return;
+      }
+      var prevHtml = fetchBtn.innerHTML;
+      fetchBtn.disabled = true;
+      fetchBtn.textContent = '获取中...';
+      try {
+        var models = await AI().fetchModels({ url: draft.baseUrl, key: draft.apiKey });
+        fetchedList = models.slice();
+        if (!modelInput.value.trim() && models.length) {
+          modelInput.value = models[0];
+        }
+        syncDropdownOptions(fetchedList, modelInput.value.trim());
+        notifyToast('已拉取 ' + models.length + ' 个模型');
+      } catch (err) {
+        var msg = (err && err.message) || '获取模型失败';
+        if (err && err.hint) msg += '（' + err.hint + '）';
+        notifyToast(msg);
+      } finally {
+        fetchBtn.disabled = false;
+        fetchBtn.innerHTML = prevHtml;
+      }
+    });
+
+    testBtn.addEventListener('click', async function() {
+      var draft = readFormDraft();
+      if (!AI() || typeof AI().testConnection !== 'function') {
+        notifyToast('AI 引擎模块未就绪');
+        return;
+      }
+      var prevHtml = testBtn.innerHTML;
+      testBtn.disabled = true;
+      testBtn.textContent = '测试中...';
+      try {
+        var res = await AI().testConnection({
+          url: draft.baseUrl,
+          key: draft.apiKey,
+          model: draft.model,
+          temperature: draft.temperature
+        });
+        showCustomModal(
+          '专属 API 连接成功',
+          '<p class="aiw-st-modal-msg">模型 <strong>' + escapeHtml(res.model) + '</strong> 响应正常（耗时 ' + res.durationMs + ' ms）。</p>' +
+          '<div class="aiw-api-test-reply">' + escapeHtml(res.reply) + '</div>',
+          '<button type="button" class="aiw-st-btn-primary" id="aiw-api-test-ok">我知道了</button>'
+        );
+      } catch (err) {
+        var errMsg = (err && err.message) || '连接测试失败';
+        var hintHtml = err && err.hint
+          ? '<div class="aiw-api-test-hint">' + escapeHtml(err.hint) + '</div>'
+          : '';
+        showCustomModal(
+          '专属 API 连接失败',
+          '<p class="aiw-st-modal-msg" style="color:#ef4444;">' + escapeHtml(errMsg) + '</p>' + hintHtml,
+          '<button type="button" class="aiw-st-btn-primary" id="aiw-api-test-ok">我知道了</button>'
+        );
+      } finally {
+        testBtn.disabled = false;
+        testBtn.innerHTML = prevHtml;
+        var okBtn = layer.querySelector('#aiw-api-test-ok');
+        if (okBtn) okBtn.addEventListener('click', closeModalOverlay);
+      }
+    });
+
+    async function doSaveCustomApi() {
+      var draft = readFormDraft();
+      var hasAny = !!(draft.baseUrl || draft.apiKey || draft.model);
+      var isComplete = S().isCustomApiComplete(draft);
+
+      _ctx.customApi = await S().saveCustomApiConfig(draft);
+      if (_ctx.customApi.complete && _ctx.customApi.model) {
+        await S().saveSelectedModel(_ctx.customApi.model);
+      }
+      if (AI() && typeof AI().resolveEffectiveApiConfig === 'function') {
+        _ctx.effectiveApi = await AI().resolveEffectiveApiConfig();
+      }
+      notifyWorkspaceStateChanged();
+      renderCurrentView();
+
+      if (isComplete) {
+        notifyToast('知屿专属 API 已保存并启用');
+      } else if (hasAny) {
+        notifyToast('已保存草稿（因未填完整，当前仍使用弯弯机主 API）');
+      } else {
+        notifyToast('已保存，当前使用弯弯机主 API');
+      }
+    }
+
+    saveBtn.addEventListener('click', doSaveCustomApi);
+    saveTopBtn.addEventListener('click', doSaveCustomApi);
+
+    clearBtn.addEventListener('click', function() {
+      showConfirmModal(
+        '清空专属 API 配置',
+        '确定要清空知屿专属 API 配置吗？清空后知屿将自动使用弯弯机现有的主 API，不会影响主设置。',
+        '确认清空',
+        true,
+        async function() {
+          _ctx.customApi = await S().clearCustomApiConfig();
+          await S().saveSelectedModel('');
+          if (AI() && typeof AI().resolveEffectiveApiConfig === 'function') {
+            _ctx.effectiveApi = await AI().resolveEffectiveApiConfig();
+          }
+          notifyWorkspaceStateChanged();
+          renderCurrentView();
+          notifyToast('已清空知屿专属 API，已切回主 API');
+        }
+      );
+    });
+  }
+
   // ===== 导航栈管理 =====
   function pushView(viewName) {
     _ctx.viewStack.push(viewName);
@@ -1262,6 +1564,9 @@
     if (view === 'home') {
       layer.innerHTML = renderSettingsHomeHtml();
       bindSettingsHomeEvents(layer);
+    } else if (view === 'custom-api') {
+      layer.innerHTML = renderCustomApiHtml();
+      bindCustomApiEvents(layer);
     } else if (view === 'personalization') {
       layer.innerHTML = renderPersonalizationHtml();
       bindPersonalizationEvents(layer);
@@ -1308,13 +1613,13 @@
         if (act === 'memory-entry') {
           showCustomModal(
             '记忆',
-            '<p class="aiw-st-modal-msg">「记忆」入口已预留。当前处于第三阶段（设置与预设中心），长期记忆存储与检索将在后续阶段正式接入。</p>',
+            '<p class="aiw-st-modal-msg">「记忆」入口已预留，长期记忆存储与检索将在后续阶段正式接入。</p>',
             '<button type="button" class="aiw-st-btn-primary" id="aiw-placeholder-ok">我知道了</button>'
           );
         } else if (act === 'plugins-entry') {
           showCustomModal(
             '插件',
-            '<p class="aiw-st-modal-msg">「插件」入口已预留。当前处于第三阶段（设置与预设中心），插件调用与扩展能力将在后续阶段正式接入。</p>',
+            '<p class="aiw-st-modal-msg">「插件」入口已预留，插件调用与扩展能力将在后续阶段正式接入。</p>',
             '<button type="button" class="aiw-st-btn-primary" id="aiw-placeholder-ok">我知道了</button>'
           );
         }
