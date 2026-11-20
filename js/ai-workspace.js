@@ -45,9 +45,23 @@
     messages: [],
     userProfile: {
       name: '我',
-      avatar: 'img/ava-00.jpg'
-    }
+      avatar: 'img/ava-00.jpg',
+      bio: '本地工作空间'
+    },
+    appearance: {
+      mode: 'system',
+      accent: 'pink'
+    },
+    general: {
+      enterToSend: true,
+      autoUseDefaultPreset: true,
+      showCharCount: true
+    },
+    defaultPreset: null
   };
+
+  var _mediaQuery = null;
+  var _mediaListener = null;
 
   function escapeHtml(str) {
     return String(str == null ? '' : str).replace(/[&<>"']/g, function(ch) {
@@ -63,7 +77,65 @@
     }
   }
 
-  async function loadReadOnlyUserProfile() {
+  function resolveEffectiveDarkMode(mode) {
+    if (mode === 'dark') return true;
+    if (mode === 'light') return false;
+    var mediaDark = !!(global.matchMedia && global.matchMedia('(prefers-color-scheme: dark)').matches);
+    var rootDark = !!(document.documentElement && document.documentElement.classList.contains('theme-dark'));
+    return mediaDark || rootDark;
+  }
+
+  function applyWorkspaceAppearance(page, appearance) {
+    if (!page) return;
+    var cfg = appearance || _state.appearance || { mode: 'system', accent: 'pink' };
+    var isDark = resolveEffectiveDarkMode(cfg.mode || 'system');
+    page.classList.toggle('aiw-theme-dark', isDark);
+    page.classList.toggle('aiw-theme-light', !isDark);
+    page.setAttribute('data-aiw-mode', cfg.mode || 'system');
+    page.setAttribute('data-aiw-accent', cfg.accent || 'pink');
+  }
+
+  function detachAppearanceMediaListener() {
+    if (_mediaQuery && _mediaListener) {
+      try {
+        if (_mediaQuery.removeEventListener) _mediaQuery.removeEventListener('change', _mediaListener);
+        else if (_mediaQuery.removeListener) _mediaQuery.removeListener(_mediaListener);
+      } catch (_) {}
+    }
+    _mediaQuery = null;
+    _mediaListener = null;
+  }
+
+  function attachAppearanceMediaListener(page) {
+    detachAppearanceMediaListener();
+    if (!global.matchMedia) return;
+    _mediaQuery = global.matchMedia('(prefers-color-scheme: dark)');
+    _mediaListener = function() {
+      var curPage = document.getElementById(PAGE_ID);
+      if (curPage && _state.appearance && _state.appearance.mode === 'system') {
+        applyWorkspaceAppearance(curPage, _state.appearance);
+      }
+    };
+    if (_mediaQuery.addEventListener) _mediaQuery.addEventListener('change', _mediaListener);
+    else if (_mediaQuery.addListener) _mediaQuery.addListener(_mediaListener);
+  }
+
+  async function loadWorkspaceState() {
+    if (global.AiWorkspaceStorage) {
+      try {
+        var results = await Promise.all([
+          global.AiWorkspaceStorage.getProfile(),
+          global.AiWorkspaceStorage.getAppearance(),
+          global.AiWorkspaceStorage.getGeneralSettings(),
+          global.AiWorkspaceStorage.getDefaultPreset()
+        ]);
+        _state.userProfile = results[0];
+        _state.appearance = results[1];
+        _state.general = results[2];
+        _state.defaultPreset = results[3];
+        return;
+      } catch (_) {}
+    }
     try {
       if (!global.db || !global.db.characters) return;
       var op = function() {
@@ -75,12 +147,21 @@
       if (user) {
         _state.userProfile = {
           name: String(user.name || user.nick || '我'),
-          avatar: String(user.avatar || 'img/ava-00.jpg')
+          avatar: String(user.avatar || 'img/ava-00.jpg'),
+          bio: '本地工作空间'
         };
       }
-    } catch (_) {
-      // 只读兜底，不影响基础 UI 打开
-    }
+    } catch (_) {}
+  }
+
+  function syncSidebarAccountDom(page) {
+    if (!page) return;
+    var avatarEl = page.querySelector('#aiw-account-avatar');
+    var nameEl = page.querySelector('#aiw-account-name');
+    var subEl = page.querySelector('#aiw-account-sub');
+    if (avatarEl) avatarEl.src = _state.userProfile.avatar || 'img/ava-00.jpg';
+    if (nameEl) nameEl.textContent = _state.userProfile.name || '我';
+    if (subEl) subEl.textContent = (_state.userProfile.bio || '本地工作空间') + ' · 设置中心';
   }
 
   function buildPageHtml() {
@@ -209,9 +290,9 @@
             '<img class="aiw-account-avatar" id="aiw-account-avatar" src="' + escapeHtml(_state.userProfile.avatar) + '" alt="用户头像">' +
             '<div class="aiw-account-info">' +
               '<div class="aiw-account-name" id="aiw-account-name">' + escapeHtml(_state.userProfile.name) + '</div>' +
-              '<div class="aiw-account-sub">本地工作空间账号</div>' +
+              '<div class="aiw-account-sub" id="aiw-account-sub">' + escapeHtml((_state.userProfile.bio || '本地工作空间') + ' · 设置中心') + '</div>' +
             '</div>' +
-            '<span class="aiw-account-chevron"><i class="fa-solid fa-angle-right"></i></span>' +
+            '<span class="aiw-account-chevron"><i class="fa-solid fa-gear"></i></span>' +
           '</button>' +
         '</div>' +
       '</aside>' +
@@ -340,9 +421,13 @@
           : '有什么可以帮你的？';
       }
       if (emptySub) {
-        emptySub.textContent = selectedSampleTitle
-          ? '此条目为侧边栏占位示例，历史对话与 AI 模型将在后续阶段接入。'
-          : '知屿 AI 工作空间基础界面已就绪';
+        if (selectedSampleTitle) {
+          emptySub.textContent = '此条目为侧边栏占位示例，历史对话与 AI 模型将在后续阶段接入。';
+        } else if (_state.general && _state.general.autoUseDefaultPreset && _state.defaultPreset) {
+          emptySub.textContent = '默认预设：' + _state.defaultPreset.name + '（模型对话将在第四阶段接入）';
+        } else {
+          emptySub.textContent = '知屿 AI 工作空间已就绪';
+        }
       }
       return;
     }
@@ -501,7 +586,26 @@
     });
 
     page.querySelector('#aiw-account-btn').addEventListener('click', function() {
-      notifyToast('当前账号：' + _state.userProfile.name + '（本地工作空间）');
+      setSidebarOpen(page, false);
+      if (global.AiWorkspaceSettings && typeof global.AiWorkspaceSettings.openSettingsCenter === 'function') {
+        global.AiWorkspaceSettings.openSettingsCenter(page, 'home', function(nextState) {
+          if (nextState) {
+            if (nextState.profile) _state.userProfile = nextState.profile;
+            if (nextState.appearance) _state.appearance = nextState.appearance;
+            if (nextState.general) _state.general = nextState.general;
+            if (Array.isArray(nextState.presets)) {
+              _state.defaultPreset = nextState.presets.find(function(p) { return p.isDefault; }) || nextState.presets[0] || null;
+            }
+          }
+          applyWorkspaceAppearance(page, _state.appearance);
+          syncSidebarAccountDom(page);
+          if (_state.messages.length === 0 && !_state.activeChatId) {
+            updateMainStage(page, null);
+          }
+        });
+      } else {
+        notifyToast('设置中心模块加载中');
+      }
     });
 
     // 底部输入框与附件菜单
@@ -510,7 +614,8 @@
       syncComposerButtons(page);
     });
     input.addEventListener('keydown', function(e) {
-      if (e.key === 'Enter' && !e.shiftKey) {
+      var enterSend = !_state.general || _state.general.enterToSend !== false;
+      if (e.key === 'Enter' && !e.shiftKey && enterSend) {
         e.preventDefault();
         handleLocalPreviewSend(page);
       }
@@ -565,6 +670,7 @@
   }
 
   function closeAiWorkspacePage() {
+    detachAppearanceMediaListener();
     var page = document.getElementById(PAGE_ID);
     if (!page) return;
     if (typeof global.closePage === 'function') {
@@ -583,11 +689,12 @@
     _state.moreNavOpen = false;
     _state.searchQuery = '';
 
-    await loadReadOnlyUserProfile();
+    await loadWorkspaceState();
 
     var page = document.createElement('div');
     page.id = PAGE_ID;
     page.className = 'full-page';
+    applyWorkspaceAppearance(page, _state.appearance);
     page.innerHTML = buildPageHtml();
 
     if (typeof global.openPage === 'function') {
@@ -596,9 +703,11 @@
       (document.getElementById('app') || document.body).appendChild(page);
     }
 
+    attachAppearanceMediaListener(page);
     renderSidebarChats(page);
     syncDeepThinkUI(page);
     syncComposerButtons(page);
+    syncSidebarAccountDom(page);
     updateMainStage(page, null);
     bindEvents(page);
   }
