@@ -703,6 +703,8 @@
       syncSidebarAccountDom(page);
       syncContextStrip(page);
       updateMainStage(page);
+    }, {
+      activeChatId: _state.activeChat ? _state.activeChat.id : ''
     });
   }
 
@@ -1394,6 +1396,13 @@
         syncSidebarMemoryBadge(document.getElementById(PAGE_ID));
         notifyToast('已自动记住 ' + (addedCount + updatedCount) + ' 条长期记忆');
       }
+      var shouldRefreshSettings = addedCount > 0 || updatedCount > 0 ||
+        (qRes.processed || 0) > 0 ||
+        (Array.isArray(qRes.summarizedChats) && qRes.summarizedChats.length > 0) ||
+        (Array.isArray(qRes.failedTasks) && qRes.failedTasks.length > 0);
+      if (shouldRefreshSettings && global.AiWorkspaceSettings && typeof global.AiWorkspaceSettings.refreshMemoryViewsIfOpen === 'function') {
+        global.AiWorkspaceSettings.refreshMemoryViewsIfOpen();
+      }
     }).catch(function(err) {
       console.warn('[AiWorkspace] background memory queue error:', err && err.message ? err.message : err);
     });
@@ -1443,7 +1452,7 @@
       historyMessages: memContext.useShortTermHistory ? historyBeforeTurn : [],
       shortTermSummary: memContext.shortTermSummary || '',
       summaryUpToCount: memContext.summaryUpToCount || 0,
-      maxRecentMessages: memContext.maxRecentMessages || 14,
+      maxRecentMessages: memContext.maxRecentMessages != null ? memContext.maxRecentMessages : 6,
       userContent: userText,
       personalization: personalization,
       preset: preset,
@@ -1608,11 +1617,52 @@
     input.value = '';
     await persistCurrentChatMessages();
 
+    // 方式 A：明确记忆指令即时解析并落库（不等待 AI 流式回复完成，且严格尊重开关与真实写库结果）
+    var explicitRes = { isExplicit: false, saved: false };
+    if (M() && typeof M().handleExplicitMemoryCommand === 'function') {
+      try {
+        explicitRes = await M().handleExplicitMemoryCommand({
+          userText: text,
+          userMsgId: userMsg.id,
+          historyMessages: historyBeforeTurn,
+          chatId: _state.activeChat ? _state.activeChat.id : '',
+          chatTitle: _state.activeChat ? _state.activeChat.title : '',
+          projectId: (_state.activeChat && _state.activeChat.projectId) || '',
+          userId: 'local_user',
+          apiConfig: effective
+        });
+        if (explicitRes && explicitRes.isExplicit) {
+          if (explicitRes.saved) {
+            syncSidebarMemoryBadge(page);
+            notifyToast('已记住（已写入长期记忆）');
+          } else if (explicitRes.blockedBySetting) {
+            notifyToast('长期记忆已关闭，本次未保存');
+          } else if (explicitRes.blockedSecret) {
+            notifyToast('检测到密码或密钥等敏感信息，已安全拦截');
+          } else if (explicitRes.alreadyExists) {
+            notifyToast('该内容已在长期记忆中');
+          } else if (explicitRes.error) {
+            notifyToast('记忆保存失败：' + explicitRes.error);
+          } else if (explicitRes.reason) {
+            notifyToast(explicitRes.reason);
+          }
+          if (global.AiWorkspaceSettings && typeof global.AiWorkspaceSettings.refreshMemoryViewsIfOpen === 'function') {
+            global.AiWorkspaceSettings.refreshMemoryViewsIfOpen();
+          }
+        }
+      } catch (expErr) {
+        notifyToast('记忆保存失败：' + ((expErr && expErr.message) || '未知错误'));
+      }
+    }
+
     _state.messages.push(assistantMsg);
     syncComposerButtons(page);
     updateMainStage(page);
 
-    await executeStreamingTurn(page, historyBeforeTurn, text, assistantMsg, effective, { userMsgId: userMsg.id });
+    await executeStreamingTurn(page, historyBeforeTurn, text, assistantMsg, effective, {
+      userMsgId: userMsg.id,
+      skipAutoMemory: !!(explicitRes && explicitRes.isExplicit)
+    });
   }
 
   async function regenerateAtMessage(page, msgId) {

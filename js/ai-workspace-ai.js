@@ -73,20 +73,29 @@
     return [];
   }
 
-  function extractNonStreamText(json) {
+  function extractNonStreamText(json, opts) {
     if (!json || typeof json !== 'object') return '';
     var choice = json.choices && json.choices[0];
     var msg = choice && choice.message;
     var content = msg ? msg.content : (choice && choice.text);
-    if (typeof content === 'string') return content;
+    if (typeof content === 'string' && content.trim()) return content;
     if (Array.isArray(content)) {
-      return content.map(function(part) {
+      var joined = content.map(function(part) {
         if (typeof part === 'string') return part;
         if (part && typeof part.text === 'string') return part.text;
         return '';
       }).join('');
+      if (joined.trim()) return joined;
     }
-    return '';
+    if (opts && opts.allowReasoningFallback && msg && typeof msg.reasoning_content === 'string' && msg.reasoning_content.trim()) {
+      return msg.reasoning_content;
+    }
+    if (Array.isArray(json.candidates) && json.candidates[0] && json.candidates[0].content && Array.isArray(json.candidates[0].content.parts)) {
+      return json.candidates[0].content.parts.map(function(p) {
+        return p && typeof p.text === 'string' ? p.text : '';
+      }).join('');
+    }
+    return typeof content === 'string' ? content : '';
   }
 
   function extractDeltaText(parsed) {
@@ -310,7 +319,7 @@
     };
   }
 
-  // ===== 提示词组装引擎（严格顺序：基础规则 -> 用户个性化 -> 预设角色 -> 短期摘要 -> 相关长期记忆 -> 跨窗口历史参考 -> 历史消息 -> 当前用户输入） =====
+  // ===== 提示词组装引擎（严格顺序：1.基础系统规则 -> 2.个性化设置 -> 3.当前预设 -> 4.相关长期记忆 -> 5.跨窗口历史参考 -> 6.当前对话摘要 -> 7.近期原始消息 -> 8.当前用户输入） =====
   function composeSystemPrompt(options) {
     var opts = options && typeof options === 'object' ? options : {};
     var personalization = opts.personalization;
@@ -361,16 +370,7 @@
       }
     }
 
-    // 4. 当前对话短期记忆摘要（覆盖更早历史轮次，避免重复叠加）
-    if (shortTermSummary) {
-      sections.push(
-        '【当前对话短期摘要（较早轮次阶段性总结）】\n' +
-        '以下为本对话此前轮次的核心上下文摘要，后续消息列表仅保留最近原始对话：\n' +
-        shortTermSummary
-      );
-    }
-
-    // 5. 按相关性筛选后的长期记忆（仅作参考辅助，不得覆盖系统规则或用户当前指令）
+    // 4. 按相关性筛选后的长期记忆（仅作参考辅助，不得覆盖系统规则或用户当前指令）
     if (memories.length > 0) {
       var memLines = memories.map(function(m) {
         var cat = m.category ? '[' + String(m.category) + '] ' : '';
@@ -385,7 +385,7 @@
       }
     }
 
-    // 6. 跨窗口历史对话摘要/片段参考（仅在开启跨窗口记忆且命中相关内容时注入）
+    // 5. 跨窗口历史对话摘要/片段参考（仅在开启跨窗口记忆与参考历史聊天且命中相关内容时注入）
     if (crossChatContexts.length > 0) {
       var crossLines = crossChatContexts.map(function(c) {
         var label = c.chatTitle ? ('「' + String(c.chatTitle) + '」') : '「历史对话」';
@@ -400,7 +400,16 @@
       }
     }
 
-    // 7. 若用户开启了深入思考 UI 开关，补充深度拆解提示
+    // 6. 当前对话短期记忆摘要（覆盖更早历史轮次，避免重复叠加）
+    if (shortTermSummary) {
+      sections.push(
+        '【当前对话短期摘要（较早轮次阶段性总结）】\n' +
+        '以下为本对话此前轮次的核心上下文摘要，后续消息列表仅保留最近原始对话：\n' +
+        shortTermSummary
+      );
+    }
+
+    // 深入思考模式补充提示
     if (deepThink) {
       sections.push(
         '【思考模式要求】\n' +
@@ -416,15 +425,22 @@
     var history = Array.isArray(opts.historyMessages) ? opts.historyMessages : [];
     var shortTermSummary = String(opts.shortTermSummary || '').trim();
     var summaryUpToCount = Math.max(0, Number(opts.summaryUpToCount) || 0);
-    var maxRecent = Math.max(4, Number(opts.maxRecentMessages) || 14);
+    var hasExplicitLimit = opts.maxRecentMessages !== undefined && opts.maxRecentMessages !== null;
+    var parsedLimit = Number(opts.maxRecentMessages);
+    var maxRecent = hasExplicitLimit && Number.isFinite(parsedLimit)
+      ? Math.max(0, Math.round(parsedLimit))
+      : 6;
 
-    // 若存在短期摘要且明确标注覆盖前 summaryUpToCount 条，则只取未摘要的最近原始消息，绝不重复叠加
-    var recentSlice = history;
-    if (shortTermSummary && summaryUpToCount > 0 && summaryUpToCount < history.length) {
-      recentSlice = history.slice(summaryUpToCount);
-    }
-    if (recentSlice.length > maxRecent) {
-      recentSlice = recentSlice.slice(recentSlice.length - maxRecent);
+    // 7. 近期原始消息：若存在短期摘要且覆盖前 summaryUpToCount 条，则只取未摘要的最近原始消息
+    var recentSlice = [];
+    if (maxRecent > 0) {
+      recentSlice = history;
+      if (shortTermSummary && summaryUpToCount > 0 && summaryUpToCount < history.length) {
+        recentSlice = history.slice(summaryUpToCount);
+      }
+      if (recentSlice.length > maxRecent) {
+        recentSlice = recentSlice.slice(recentSlice.length - maxRecent);
+      }
     }
 
     var systemText = composeSystemPrompt(opts);
@@ -442,6 +458,7 @@
       out.push({ role: msg.role, content: String(msg.content) });
     }
 
+    // 8. 当前用户输入
     if (opts.userContent != null && String(opts.userContent).trim()) {
       out.push({ role: 'user', content: String(opts.userContent) });
     }
@@ -732,7 +749,7 @@
       throw new Error((json.error && json.error.message) || String(json.error));
     }
     return {
-      content: extractNonStreamText(json).trim(),
+      content: extractNonStreamText(json, { allowReasoningFallback: !!opts.allowReasoningFallback }).trim(),
       model: (json && json.model) || model,
       source: cfg.source || 'unknown'
     };

@@ -25,11 +25,54 @@
     DELETED_MEMORY_SIGS: 'aiw_deleted_memory_sigs'
   };
 
+  var MEMORY_STRATEGY_PRESETS = {
+    natural: {
+      id: 'natural',
+      label: '自然 · 推荐',
+      summary: '兼顾上下文连贯与开销控制，适合日常绝大多数对话',
+      summaryTriggerChars: 3200,
+      recentRawMessagesLimit: 6,
+      maxMemoryRecallCount: 5,
+      maxSingleMemoryLength: 260
+    },
+    token_saver: {
+      id: 'token_saver',
+      label: '省 Token',
+      summary: '更早触发阶段摘要并精简近期原文与记忆召回条数，减少上下文占用',
+      summaryTriggerChars: 1400,
+      recentRawMessagesLimit: 4,
+      maxMemoryRecallCount: 2,
+      maxSingleMemoryLength: 140
+    },
+    recall_more: {
+      id: 'recall_more',
+      label: '记得更多',
+      summary: '保留更多近期原始消息与历史记忆召回条数，适合复杂长程协作',
+      summaryTriggerChars: 5600,
+      recentRawMessagesLimit: 12,
+      maxMemoryRecallCount: 8,
+      maxSingleMemoryLength: 380
+    }
+  };
+
+  var MEMORY_SETTING_BOUNDS = {
+    summaryTriggerChars: { min: 400, max: 12000, def: 3200 },
+    recentRawMessagesLimit: { min: 2, max: 24, def: 6 },
+    maxMemoryRecallCount: { min: 1, max: 12, def: 5 },
+    maxSingleMemoryLength: { min: 60, max: 500, def: 260 }
+  };
+
   var DEFAULT_MEMORY_SETTINGS = {
     shortTermContext: true,
     crossChatMemory: true,
     useMemory: true,
     autoMemory: true,
+    referenceHistoryChats: true,
+    strategy: 'natural',
+    summaryTriggerChars: 3200,
+    recentRawMessagesLimit: 6,
+    maxMemoryRecallCount: 5,
+    maxSingleMemoryLength: 260,
     updatedAt: 0
   };
 
@@ -863,28 +906,73 @@
     };
   }
 
+  function clampMemoryNumericSetting(key, rawVal, fallbackVal) {
+    var spec = MEMORY_SETTING_BOUNDS[key];
+    if (!spec) return Number(rawVal) || 0;
+    var n = Math.round(Number(rawVal));
+    if (!Number.isFinite(n)) {
+      return typeof fallbackVal === 'number' && Number.isFinite(fallbackVal) ? fallbackVal : spec.def;
+    }
+    if (n < spec.min) return spec.min;
+    if (n > spec.max) return spec.max;
+    return n;
+  }
+
+  function sanitizeMemorySettings(raw, base) {
+    var src = raw && typeof raw === 'object' ? raw : {};
+    var prev = base && typeof base === 'object' ? base : DEFAULT_MEMORY_SETTINGS;
+    var strategy = src.strategy != null ? String(src.strategy) : String(prev.strategy || 'natural');
+    if (!MEMORY_STRATEGY_PRESETS[strategy]) strategy = 'natural';
+
+    return {
+      shortTermContext: typeof src.shortTermContext === 'boolean' ? src.shortTermContext : (prev.shortTermContext !== false),
+      crossChatMemory: typeof src.crossChatMemory === 'boolean' ? src.crossChatMemory : (prev.crossChatMemory !== false),
+      useMemory: typeof src.useMemory === 'boolean' ? src.useMemory : (prev.useMemory !== false),
+      autoMemory: typeof src.autoMemory === 'boolean' ? src.autoMemory : (prev.autoMemory !== false),
+      referenceHistoryChats: typeof src.referenceHistoryChats === 'boolean' ? src.referenceHistoryChats : (prev.referenceHistoryChats !== false),
+      strategy: strategy,
+      summaryTriggerChars: clampMemoryNumericSetting('summaryTriggerChars', src.summaryTriggerChars, prev.summaryTriggerChars),
+      recentRawMessagesLimit: clampMemoryNumericSetting('recentRawMessagesLimit', src.recentRawMessagesLimit, prev.recentRawMessagesLimit),
+      maxMemoryRecallCount: clampMemoryNumericSetting('maxMemoryRecallCount', src.maxMemoryRecallCount, prev.maxMemoryRecallCount),
+      maxSingleMemoryLength: clampMemoryNumericSetting('maxSingleMemoryLength', src.maxSingleMemoryLength, prev.maxSingleMemoryLength),
+      updatedAt: Number(src.updatedAt) || Number(prev.updatedAt) || 0
+    };
+  }
+
   async function getMemorySettings() {
     var saved = await dbGetConfig(KEYS.MEMORY_SETTINGS);
-    var src = saved && typeof saved === 'object' ? saved : {};
-    return {
-      shortTermContext: typeof src.shortTermContext === 'boolean' ? src.shortTermContext : DEFAULT_MEMORY_SETTINGS.shortTermContext,
-      crossChatMemory: typeof src.crossChatMemory === 'boolean' ? src.crossChatMemory : DEFAULT_MEMORY_SETTINGS.crossChatMemory,
-      useMemory: typeof src.useMemory === 'boolean' ? src.useMemory : DEFAULT_MEMORY_SETTINGS.useMemory,
-      autoMemory: typeof src.autoMemory === 'boolean' ? src.autoMemory : DEFAULT_MEMORY_SETTINGS.autoMemory,
-      updatedAt: Number(src.updatedAt) || 0
-    };
+    return sanitizeMemorySettings(saved, DEFAULT_MEMORY_SETTINGS);
   }
 
   async function saveMemorySettings(patch) {
     var current = await getMemorySettings();
     var p = patch && typeof patch === 'object' ? patch : {};
-    var next = {
-      shortTermContext: typeof p.shortTermContext === 'boolean' ? p.shortTermContext : current.shortTermContext,
-      crossChatMemory: typeof p.crossChatMemory === 'boolean' ? p.crossChatMemory : current.crossChatMemory,
-      useMemory: typeof p.useMemory === 'boolean' ? p.useMemory : current.useMemory,
-      autoMemory: typeof p.autoMemory === 'boolean' ? p.autoMemory : current.autoMemory,
-      updatedAt: Date.now()
-    };
+    var nextInput = Object.assign({}, current, p, { updatedAt: Date.now() });
+    if (p.strategy && MEMORY_STRATEGY_PRESETS[p.strategy] && p.applyStrategyPreset !== false) {
+      var preset = MEMORY_STRATEGY_PRESETS[p.strategy];
+      if (p.summaryTriggerChars === undefined) nextInput.summaryTriggerChars = preset.summaryTriggerChars;
+      if (p.recentRawMessagesLimit === undefined) nextInput.recentRawMessagesLimit = preset.recentRawMessagesLimit;
+      if (p.maxMemoryRecallCount === undefined) nextInput.maxMemoryRecallCount = preset.maxMemoryRecallCount;
+      if (p.maxSingleMemoryLength === undefined) nextInput.maxSingleMemoryLength = preset.maxSingleMemoryLength;
+    }
+    var next = sanitizeMemorySettings(nextInput, current);
+    next.updatedAt = Date.now();
+    return await dbPutConfig(KEYS.MEMORY_SETTINGS, next);
+  }
+
+  async function applyMemoryStrategy(strategyId) {
+    var preset = MEMORY_STRATEGY_PRESETS[strategyId] || MEMORY_STRATEGY_PRESETS.natural;
+    return await saveMemorySettings({
+      strategy: preset.id,
+      summaryTriggerChars: preset.summaryTriggerChars,
+      recentRawMessagesLimit: preset.recentRawMessagesLimit,
+      maxMemoryRecallCount: preset.maxMemoryRecallCount,
+      maxSingleMemoryLength: preset.maxSingleMemoryLength
+    });
+  }
+
+  async function resetMemorySettingsToDefaults() {
+    var next = Object.assign({}, DEFAULT_MEMORY_SETTINGS, { updatedAt: Date.now() });
     return await dbPutConfig(KEYS.MEMORY_SETTINGS, next);
   }
 
@@ -1028,13 +1116,55 @@
     return 'memtask_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7);
   }
 
+  function sanitizeTaskErrorText(rawErr) {
+    var s = String(rawErr || '').trim();
+    if (!s) return '';
+    return s
+      .replace(/\bsk-(?:proj-|live-|test-)?[A-Za-z0-9_-]{8,}\b/gi, 'sk-***')
+      .replace(/\bBearer\s+[A-Za-z0-9._-]{8,}\b/gi, 'Bearer ***')
+      .replace(/\bAIza[0-9A-Za-z_-]{10,}\b/g, 'AIza***')
+      .slice(0, 220);
+  }
+
+  function normalizeMemoryTaskRecord(raw) {
+    var src = raw && typeof raw === 'object' ? raw : {};
+    var status = String(src.status || 'pending');
+    if (status === 'done') {
+      status = src.memoryWritten ? 'saved' : 'skipped';
+    }
+    if (['pending', 'running', 'saved', 'skipped', 'failed', 'retry_waiting'].indexOf(status) === -1) {
+      status = 'pending';
+    }
+    var savedIds = Array.isArray(src.savedMemoryIds) ? src.savedMemoryIds.filter(Boolean).map(String) : [];
+    return {
+      id: String(src.id || generateTaskId()),
+      type: String(src.type || 'extract_memory'),
+      turnKey: String(src.turnKey || '').trim(),
+      chatId: String(src.chatId || ''),
+      chatTitle: String(src.chatTitle || ''),
+      projectId: String(src.projectId || ''),
+      userId: String(src.userId || 'local_user'),
+      payload: src.payload && typeof src.payload === 'object' ? src.payload : {},
+      status: status,
+      attempts: Math.max(0, Number(src.attempts) || 0),
+      maxAttempts: Math.max(1, Number(src.maxAttempts) || 3),
+      memoryWritten: typeof src.memoryWritten === 'boolean' ? src.memoryWritten : (savedIds.length > 0),
+      savedMemoryIds: savedIds,
+      lastError: sanitizeTaskErrorText(src.lastError),
+      resultSummary: String(src.resultSummary || '').slice(0, 200),
+      createdAt: Number(src.createdAt) || Date.now(),
+      updatedAt: Number(src.updatedAt) || Date.now(),
+      nextRetryAt: Number(src.nextRetryAt) || 0
+    };
+  }
+
   async function listMemoryTasks() {
     var tasks = await dbGetConfig(KEYS.MEMORY_TASKS);
-    return Array.isArray(tasks) ? tasks : [];
+    return Array.isArray(tasks) ? tasks.map(normalizeMemoryTaskRecord) : [];
   }
 
   async function saveMemoryTasks(tasks) {
-    var arr = Array.isArray(tasks) ? tasks.slice(0, 40) : [];
+    var arr = Array.isArray(tasks) ? tasks.slice(0, 40).map(normalizeMemoryTaskRecord) : [];
     return await dbPutConfig(KEYS.MEMORY_TASKS, arr);
   }
 
@@ -1044,29 +1174,33 @@
     var turnKey = String(src.turnKey || '').trim();
     if (turnKey) {
       var dup = tasks.find(function(t) {
-        return t && t.turnKey === turnKey && (t.status === 'pending' || t.status === 'running' || t.status === 'done');
+        return t && t.turnKey === turnKey && (
+          t.status === 'pending' || t.status === 'running' || t.status === 'saved' || t.status === 'skipped'
+        );
       });
       if (dup) return dup;
     }
     var now = Date.now();
-    var task = {
+    var task = normalizeMemoryTaskRecord({
       id: src.id || generateTaskId(),
-      type: String(src.type || 'extract_memory'),
+      type: src.type || 'extract_memory',
       turnKey: turnKey,
-      chatId: String(src.chatId || ''),
-      chatTitle: String(src.chatTitle || ''),
-      projectId: String(src.projectId || ''),
-      userId: String(src.userId || 'local_user'),
+      chatId: src.chatId || '',
+      chatTitle: src.chatTitle || '',
+      projectId: src.projectId || '',
+      userId: src.userId || 'local_user',
       payload: src.payload || {},
-      status: 'pending',
-      attempts: 0,
+      status: src.status || 'pending',
+      attempts: src.attempts || 0,
       maxAttempts: Math.max(1, Number(src.maxAttempts) || 3),
-      lastError: '',
-      resultSummary: '',
-      createdAt: now,
-      updatedAt: now,
-      nextRetryAt: 0
-    };
+      memoryWritten: !!src.memoryWritten,
+      savedMemoryIds: Array.isArray(src.savedMemoryIds) ? src.savedMemoryIds : [],
+      lastError: src.lastError || '',
+      resultSummary: src.resultSummary || '',
+      createdAt: src.createdAt || now,
+      updatedAt: src.updatedAt || now,
+      nextRetryAt: src.nextRetryAt || 0
+    });
     tasks.unshift(task);
     await saveMemoryTasks(tasks);
     return task;
@@ -1077,10 +1211,14 @@
     var tasks = await listMemoryTasks();
     var idx = tasks.findIndex(function(t) { return t && t.id === taskId; });
     if (idx === -1) return null;
-    var next = Object.assign({}, tasks[idx], patch || {}, {
+    var merged = Object.assign({}, tasks[idx], patch || {}, {
       id: tasks[idx].id,
       updatedAt: Date.now()
     });
+    if (patch && patch.lastError !== undefined) {
+      merged.lastError = sanitizeTaskErrorText(patch.lastError);
+    }
+    var next = normalizeMemoryTaskRecord(merged);
     tasks[idx] = next;
     await saveMemoryTasks(tasks);
     return next;
@@ -1088,7 +1226,9 @@
 
   async function clearFinishedMemoryTasks() {
     var tasks = await listMemoryTasks();
-    var active = tasks.filter(function(t) { return t && (t.status === 'pending' || t.status === 'running'); });
+    var active = tasks.filter(function(t) {
+      return t && (t.status === 'pending' || t.status === 'running' || t.status === 'retry_waiting');
+    });
     await saveMemoryTasks(active);
     return active;
   }
@@ -1098,6 +1238,9 @@
     ACCENT_PRESETS: ACCENT_PRESETS,
     MEMORY_CATEGORIES: MEMORY_CATEGORIES,
     MEMORY_SCOPES: MEMORY_SCOPES,
+    MEMORY_STRATEGY_PRESETS: MEMORY_STRATEGY_PRESETS,
+    MEMORY_SETTING_BOUNDS: MEMORY_SETTING_BOUNDS,
+    DEFAULT_MEMORY_SETTINGS: DEFAULT_MEMORY_SETTINGS,
     normalizeBaseUrl: normalizeBaseUrl,
     normalizeTemperature: normalizeTemperature,
     isCustomApiComplete: isCustomApiComplete,
@@ -1135,8 +1278,11 @@
     togglePinChat: togglePinChat,
     deleteChat: deleteChat,
     searchChats: searchChats,
+    sanitizeMemorySettings: sanitizeMemorySettings,
     getMemorySettings: getMemorySettings,
     saveMemorySettings: saveMemorySettings,
+    applyMemoryStrategy: applyMemoryStrategy,
+    resetMemorySettingsToDefaults: resetMemorySettingsToDefaults,
     listMemories: listMemories,
     getMemory: getMemory,
     createMemory: createMemory,
