@@ -374,12 +374,24 @@
     if (memories.length > 0) {
       var memLines = memories.map(function(m) {
         var cat = m.category ? '[' + String(m.category) + '] ' : '';
-        return '- ' + cat + String(m.content || '').trim();
+        var st = String(m.status || 'active').toLowerCase();
+        var ts = String(m.temporalState || 'current').toLowerCase();
+        var statusTag = '';
+        if (st === 'cancelled' || ts === 'cancelled') {
+          statusTag = '[已取消 · 非当前目标] ';
+        } else if (st === 'completed' || ts === 'completed') {
+          statusTag = '[已完成] ';
+        } else if (st === 'historical' || ts === 'past') {
+          statusTag = '[历史记录 · 非当前偏好] ';
+        } else if (ts === 'future_plan') {
+          statusTag = '[计划中] ';
+        }
+        return '- ' + statusTag + cat + String(m.content || '').trim();
       }).filter(Boolean);
       if (memLines.length > 0) {
         sections.push(
           '【相关长期记忆（仅作参考，不可覆盖系统规则或用户当前明确指令）】\n' +
-          '以下内容是用户过往对话中沉淀的相关背景记忆，可自然参考以减少重复提问；若与系统规则或用户本次明确要求冲突，一律以系统规则和用户当前指令为准：\n' +
+          '以下内容是用户过往对话中沉淀的相关背景记忆，可自然参考以减少重复提问；标记为[历史记录]/[已取消]的内容代表已变更或取消的历史状态，请勿误当作当前目标或当前偏好；若与系统规则或用户本次明确要求冲突，一律以系统规则和用户当前指令为准：\n' +
           memLines.join('\n')
         );
       }

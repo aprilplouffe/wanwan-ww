@@ -1637,17 +1637,34 @@
 
     return list.map(function(m) {
       var sourceLabel = m.sourceChatTitle ? ('来源：' + m.sourceChatTitle) : '手动添加';
+      if (m.factSource === 'context_resolved') sourceLabel += ' · 上下文指代消解';
       var timeLabel = formatMemoryDate(m.updatedAt || m.createdAt);
+      var statusLabel = '';
+      var st = String(m.status || 'active').toLowerCase();
+      var ts = String(m.temporalState || 'current').toLowerCase();
+      if (st === 'cancelled' || ts === 'cancelled') statusLabel = '已取消';
+      else if (st === 'completed' || ts === 'completed') statusLabel = '已完成';
+      else if (st === 'historical' || ts === 'past') statusLabel = '历史记录';
+      else if (ts === 'future_plan') statusLabel = '计划中';
+
+      var confPct = typeof m.confidence === 'number' && Number.isFinite(m.confidence)
+        ? Math.round(m.confidence * 100) + '%'
+        : '';
+      var prevHint = m.previousContent ? ('变更自「' + m.previousContent + '」') : '';
+
       return (
         '<div class="aiw-mem-card" data-mem-id="' + escapeHtml(m.id) + '">' +
           '<div class="aiw-mem-card-top">' +
             '<div class="aiw-mem-badges">' +
               '<span class="aiw-mem-badge is-cat">' + escapeHtml(m.category || '备忘') + '</span>' +
+              (statusLabel ? '<span class="aiw-mem-badge is-status">' + escapeHtml(statusLabel) + '</span>' : '') +
               '<span class="aiw-mem-badge is-scope">' + escapeHtml(formatScopeLabel(m.scope)) + '</span>' +
               '<span class="aiw-mem-badge is-imp">重要度 ' + escapeHtml(String(m.importance || 3)) + '/5</span>' +
+              (confPct ? '<span class="aiw-mem-badge is-conf">置信 ' + escapeHtml(confPct) + '</span>' : '') +
             '</div>' +
           '</div>' +
           '<div class="aiw-mem-content">' + escapeHtml(m.content) + '</div>' +
+          (prevHint ? '<div class="aiw-mem-meta" style="margin-top:4px;"><span class="aiw-mem-source">' + escapeHtml(prevHint) + '</span></div>' : '') +
           '<div class="aiw-mem-meta">' +
             '<span class="aiw-mem-source">' + escapeHtml(sourceLabel) + '</span>' +
             (timeLabel ? '<span class="aiw-mem-time">' + escapeHtml(timeLabel) + '</span>' : '') +

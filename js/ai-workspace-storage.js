@@ -888,9 +888,50 @@
     return Math.max(1, Math.min(5, n));
   }
 
+  function normalizeTemporalState(val, statusHint) {
+    var v = String(val || '').trim().toLowerCase();
+    if (['current', 'past', 'future_plan', 'completed', 'cancelled'].indexOf(v) !== -1) return v;
+    var st = String(statusHint || '').trim().toLowerCase();
+    if (st === 'historical') return 'past';
+    if (st === 'completed') return 'completed';
+    if (st === 'cancelled') return 'cancelled';
+    return 'current';
+  }
+
+  function normalizeMemoryStatus(val, temporalState) {
+    var v = String(val || '').trim().toLowerCase();
+    if (['active', 'historical', 'completed', 'cancelled'].indexOf(v) !== -1) return v;
+    if (temporalState === 'past') return 'historical';
+    if (temporalState === 'completed') return 'completed';
+    if (temporalState === 'cancelled') return 'cancelled';
+    return 'active';
+  }
+
+  function normalizeConfidenceValue(val) {
+    if (val === undefined || val === null || val === '') return 0.85;
+    var n = Number(val);
+    if (!Number.isFinite(n)) return 0.85;
+    if (n > 1 && n <= 100) n = n / 100;
+    return Math.round(Math.max(0, Math.min(1, n)) * 100) / 100;
+  }
+
   function normalizeMemoryRecord(raw, forcedId) {
     var now = Date.now();
     var src = raw && typeof raw === 'object' ? raw : {};
+    var temporalState = normalizeTemporalState(src.temporalState, src.status);
+    var status = normalizeMemoryStatus(src.status, temporalState);
+    var historyList = Array.isArray(src.history) ? src.history.slice(0, 3).map(function(h) {
+      if (!h || typeof h !== 'object') return null;
+      var hc = String(h.content || '').trim();
+      if (!hc) return null;
+      return {
+        content: hc.slice(0, 260),
+        updatedAt: Number(h.updatedAt) || now,
+        temporalState: normalizeTemporalState(h.temporalState, h.status),
+        status: normalizeMemoryStatus(h.status, h.temporalState)
+      };
+    }).filter(Boolean) : [];
+
     return {
       id: String(forcedId || src.id || generateMemoryId()),
       content: String(src.content || '').trim(),
@@ -902,7 +943,15 @@
       importance: normalizeImportance(src.importance),
       scope: normalizeMemoryScope(src.scope),
       userId: String(src.userId || 'local_user').trim() || 'local_user',
-      projectId: String(src.projectId || '').trim()
+      projectId: String(src.projectId || '').trim(),
+      confidence: normalizeConfidenceValue(src.confidence),
+      temporalState: temporalState,
+      status: status,
+      factSource: String(src.factSource || 'user_statement').trim() || 'user_statement',
+      relation: String(src.relation || 'new').trim() || 'new',
+      supersedesId: String(src.supersedesId || '').trim(),
+      previousContent: String(src.previousContent || '').trim().slice(0, 260),
+      history: historyList
     };
   }
 
@@ -1031,10 +1080,24 @@
     var existing = await getMemory(id);
     if (!existing) return null;
     var p = patch && typeof patch === 'object' ? patch : {};
+    var nextHistory = Array.isArray(p.history) ? p.history.slice(0, 3) : (Array.isArray(existing.history) ? existing.history.slice(0, 3) : []);
+    var prevContent = existing.previousContent || '';
+    if (p.content && String(p.content).trim() !== existing.content) {
+      prevContent = existing.content;
+      nextHistory.unshift({
+        content: existing.content,
+        updatedAt: existing.updatedAt || existing.createdAt,
+        temporalState: existing.temporalState || 'current',
+        status: existing.status || 'active'
+      });
+      nextHistory = nextHistory.slice(0, 3);
+    }
     var next = normalizeMemoryRecord(Object.assign({}, existing, p, {
       id: existing.id,
       createdAt: existing.createdAt,
-      updatedAt: Date.now()
+      updatedAt: Date.now(),
+      previousContent: p.previousContent != null ? p.previousContent : prevContent,
+      history: nextHistory
     }), existing.id);
     if (!next.content) return null;
     await dbPutConfig(KEYS.MEMORY_PREFIX + existing.id, next);

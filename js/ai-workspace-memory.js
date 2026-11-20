@@ -774,6 +774,7 @@
       });
     }
 
+    var asksHistoryOrCancelled = /(?:以前|曾经|原来|过去|历史|之前喜欢|取消|放弃|已取消|完成)/.test(rawQueryLower);
     var scoredMemories = [];
     for (var i = 0; i < accessibleMemories.length; i++) {
       var mem = accessibleMemories[i];
@@ -781,6 +782,15 @@
       if (res.score > 0) {
         res.score += ((Number(mem.importance) || 3) - 3) * 0.25;
         if (mem.scope === 'chat') res.score += 0.3;
+        var memStatus = String(mem.status || 'active').toLowerCase();
+        var memTemporal = String(mem.temporalState || 'current').toLowerCase();
+        if (memStatus === 'cancelled' || memTemporal === 'cancelled') {
+          res.score += asksHistoryOrCancelled ? 0.5 : -2.2;
+        } else if (memStatus === 'historical' || memTemporal === 'past' || memStatus === 'completed' || memTemporal === 'completed') {
+          res.score += asksHistoryOrCancelled ? 0.5 : -1.4;
+        } else {
+          res.score += 1.2;
+        }
       }
       if (res.score >= minScore && (metaRecall || res.hasLexicalOrConceptMatch)) {
         scoredMemories.push({ memory: mem, score: res.score });
@@ -911,20 +921,35 @@
     return { matched: fast.matched, intent: fast.intent, via: fast.via };
   }
 
+  function detectUnsupportedMonitoringOrReminderRequest(text) {
+    var src = String(text || '').trim();
+    if (!src) return { needsCapabilityCheck: false, hasScheduledTaskSupport: false, capabilityNotice: '' };
+    if (/(?:持续关注|长期关注|一直关注|帮我盯着|一直盯着|定期关注|自动追踪|自动监测|定期监测|定时提醒|定期提醒|每天提醒|每周提醒|有进展通知我|有更新通知我|到时候提醒我|后台监控)/.test(src)) {
+      return {
+        needsCapabilityCheck: true,
+        hasScheduledTaskSupport: false,
+        capabilityNotice: '能力边界说明：知屿当前尚未接入后台「定时任务 / 自动监测 / 主动提醒」功能（定时任务入口目前仅作占位展示）。系统只能将该内容存入长期记忆，供你后续主动追问或延续对话时参考，无法在后台自动追踪或定时提醒。请在回答中向用户如实说明此能力限制，切勿承诺会后台持续监测或定时推送提醒。'
+      };
+    }
+    return { needsCapabilityCheck: false, hasScheduledTaskSupport: false, capabilityNotice: '' };
+  }
+
   function looksLikeSoftMemoryIntent(userText) {
     var text = String(userText || '').trim();
     if (!text || text.length < 4) return false;
     if (isPureGreetingOrFiller(text) || isPureQuestionWithoutFact(text)) return false;
-    return /(?:记忆|记住|记一下|记着|忘掉|忘记|算了.*不要|别再提|不要再提|不再喜欢|以后.*都按|以后我更|从今以后|往后都|刚才说的|前面说的|之前说的|这件事|那件事|留个底)/.test(text);
+    return /(?:记忆|记住|记一下|记着|忘掉|忘记|算了.*不要|别再提|不要再提|不再喜欢|以后.*都按|以后就按|按这个来|以后我更|从今以后|往后都|刚才说的|前面说的|之前说的|这件事|那件事|留个底|持续关注|一直关注|帮我盯着|那个项目|这个项目|那个计划|这个计划)/.test(text);
   }
 
   function hasVagueContextReference(text) {
     var s = String(text || '').trim();
     if (!s) return true;
-    if (/^(?:这个|那个|上面|前面|刚才|刚刚|这件事|那件事|上述|以上|下面这些|这些|那些|它|这事|那事|刚才那个|刚才说的|刚刚说的|前面说的|上面说的)(?:[，,。\s]*(?:计划|事|事情|东西|内容|决定|偏好))?$/.test(s)) {
+    if (/^(?:这个|那个|上面|前面|刚才|刚刚|这件事|那件事|上述|以上|下面这些|这些|那些|它|这事|那事|刚才那个|刚才说的|刚刚说的|前面说的|上面说的|之前说的)(?:[，,。\s]*(?:计划|项目|方案|事|事情|东西|内容|决定|偏好))?$/.test(s)) {
       return true;
     }
-    if (/(?:上面说的|刚才说的|刚刚说的|前面提到的|前面说的|这个方案|那个方案|刚才那个|这件事|那件事)/.test(s) && s.length <= 28) {
+    if (/(?:上面说的|刚才说的|刚刚说的|前面提到的|前面说的|之前说的|刚才那个|刚刚那个|上面那个|前面那个|这个方案|那个方案|这个项目|那个项目|这个计划|那个计划|这件事|那件事|就按这个来|按这个来)/.test(s) &&
+        !/(?:名叫|叫做|《|：|:)/.test(s) &&
+        s.length <= 38) {
       return true;
     }
     return false;
@@ -1051,11 +1076,174 @@
       var m = list[i];
       if (!m || m.role !== 'user') continue;
       var txt = String(m.content || '').trim();
-      if (txt.length >= 4 && !isPureGreetingOrFiller(txt) && !hasVagueContextReference(txt) && !detectMemoryIntentFast(txt).matched) {
+      if (txt.length >= 4 && !isPureGreetingOrFiller(txt) && !hasVagueContextReference(txt) && !detectMemoryIntentFast(txt).matched && !isPureQuestionWithoutFact(txt)) {
+        return true;
+      }
+    }
+    for (var j = list.length - 1; j >= 0; j--) {
+      var am = list[j];
+      if (!am || am.role !== 'assistant') continue;
+      var atxt = String(am.content || '').trim();
+      if (atxt.length >= 10 && !isPureGreetingOrFiller(atxt) && !/[？?]$/.test(atxt)) {
         return true;
       }
     }
     return false;
+  }
+
+  function resolveContextReferenceFromHistory(userText, historyMessages, maxLen) {
+    var src = String(userText || '').trim();
+    var list = Array.isArray(historyMessages) ? historyMessages : [];
+    if (!src || !list.length || !hasVagueContextReference(src)) return null;
+
+    var wantsProject = /(?:项目|软件|应用|系统|产品|工具|app)/i.test(src);
+    var wantsPlan = /(?:计划|打算|安排|方案|目标|学习)/.test(src);
+    var wantsFollow = /(?:持续关注|长期关注|一直关注|盯着|跟进|记住|记一下|记着|按这个来)/.test(src);
+    var limit = Math.max(60, Number(maxLen) || DEFAULT_MAX_MEM_LENGTH);
+
+    for (var i = list.length - 1; i >= 0; i--) {
+      var m = list[i];
+      if (!m || m.role !== 'user') continue;
+      var txt = String(m.content || '').trim();
+      if (!txt || txt.length < 4 || isPureGreetingOrFiller(txt) || hasVagueContextReference(txt) || isPureQuestionWithoutFact(txt)) {
+        continue;
+      }
+      if (containsSensitiveSecret(txt) || containsHighRiskPrivacy(txt) || isGuessHypothesisOrThirdPartyQuote(txt)) {
+        continue;
+      }
+
+      if (wantsProject || !wantsPlan) {
+        var mNamedProj = txt.match(/(?:名叫|叫做|名为|叫)([^，,。；;！!\n的]{2,24}?)(?:的(?:AI|ai)?(?:项目|软件|应用|系统|产品|工具)|$)/);
+        if (mNamedProj && mNamedProj[1]) {
+          var pName = mNamedProj[1].replace(/[「」《》"']/g, '').trim();
+          if (pName) {
+            var pFact = '用户正在推进项目「' + pName + '」' + (wantsFollow ? '（希望重点关注）' : '');
+            return {
+              intent: 'save',
+              action: 'add',
+              shouldSave: true,
+              aboutUser: true,
+              isDurable: true,
+              factType: 'direct_fact',
+              factSource: 'context_resolved',
+              temporalState: 'current',
+              status: 'active',
+              confidence: 0.88,
+              content: pFact.slice(0, limit),
+              category: '项目',
+              importance: 4,
+              scope: 'user'
+            };
+          }
+        }
+
+        var mDevProj = txt.match(/(?:正在|在)(?:开发|制作|研发|搭建|推进|筹备|做)([^，,。；;！!\n]{2,36})/);
+        if (mDevProj && mDevProj[1]) {
+          var projDesc = cleanHighCertaintyClauseTail(mDevProj[1]);
+          if (projDesc && !/^(?:什么|哪个|怎么)/.test(projDesc)) {
+            var dFact = '用户正在推进项目：' + projDesc + (wantsFollow ? '（希望重点关注）' : '');
+            return {
+              intent: 'save',
+              action: 'add',
+              shouldSave: true,
+              aboutUser: true,
+              isDurable: true,
+              factType: 'direct_fact',
+              factSource: 'context_resolved',
+              temporalState: 'current',
+              status: 'active',
+              confidence: 0.86,
+              content: dFact.slice(0, limit),
+              category: '项目',
+              importance: 4,
+              scope: 'user'
+            };
+          }
+        }
+      }
+
+      if (wantsPlan || !wantsProject) {
+        var mPlan = txt.match(/(?:准备|打算|计划|决定|开始)(?:长期)?([^，,。；;！!\n]{2,38})/);
+        if (mPlan && mPlan[1]) {
+          var planDesc = cleanHighCertaintyClauseTail(mPlan[1]);
+          if (planDesc) {
+            return {
+              intent: 'save',
+              action: 'add',
+              shouldSave: true,
+              aboutUser: true,
+              isDurable: true,
+              factType: 'direct_fact',
+              factSource: 'context_resolved',
+              temporalState: 'future_plan',
+              status: 'active',
+              confidence: 0.85,
+              content: ('用户计划' + planDesc).slice(0, limit),
+              category: '长期计划',
+              importance: 4,
+              scope: 'user'
+            };
+          }
+        }
+      }
+
+      var extractedFromHist = extractHighCertaintyFactCandidates(txt, limit);
+      if (extractedFromHist.length > 0) {
+        var picked = Object.assign({}, extractedFromHist[0], {
+          factSource: 'context_resolved',
+          confidence: 0.85
+        });
+        return picked;
+      }
+
+      if (txt.length >= 6 && txt.length <= 120 && !/[？?]$/.test(txt)) {
+        var resolvedFact = convertFirstPersonToThirdPerson(txt.replace(/[。！!]+$/, ''));
+        return {
+          intent: 'save',
+          action: 'add',
+          shouldSave: true,
+          aboutUser: true,
+          isDurable: true,
+          factType: 'direct_fact',
+          factSource: 'context_resolved',
+          temporalState: 'current',
+          status: 'active',
+          confidence: 0.82,
+          content: resolvedFact.slice(0, limit),
+          category: inferMemoryCategoryFromText(txt),
+          importance: 4,
+          scope: 'user'
+        };
+      }
+    }
+
+    for (var j = list.length - 1; j >= 0; j--) {
+      var am = list[j];
+      if (!am || am.role !== 'assistant') continue;
+      var atxt = String(am.content || '').replace(/\s+/g, ' ').trim();
+      if (atxt.length >= 10 && !isPureGreetingOrFiller(atxt) && !/[？?]$/.test(atxt) && !containsSensitiveSecret(atxt)) {
+        if (/(?:按这个来|就按这样|方案|格式|规则|计划)/.test(src)) {
+          return {
+            intent: 'save',
+            action: 'add',
+            shouldSave: true,
+            aboutUser: true,
+            isDurable: true,
+            factType: 'direct_fact',
+            factSource: 'context_resolved',
+            temporalState: 'current',
+            status: 'active',
+            confidence: 0.8,
+            content: ('用户确认后续采用约定方案：' + atxt.slice(0, 120)).slice(0, limit),
+            category: '决定',
+            importance: 4,
+            scope: 'user'
+          };
+        }
+      }
+    }
+
+    return null;
   }
 
   async function skipQueuedTasksMatchingDeleted(store, deletedMemories) {
@@ -1094,6 +1282,25 @@
     return Math.max(0, Math.min(1, n));
   }
 
+  function normalizeItemTemporalState(val, statusHint) {
+    var v = String(val || '').trim().toLowerCase();
+    if (['current', 'past', 'future_plan', 'completed', 'cancelled'].indexOf(v) !== -1) return v;
+    var st = String(statusHint || '').trim().toLowerCase();
+    if (st === 'historical') return 'past';
+    if (st === 'completed') return 'completed';
+    if (st === 'cancelled') return 'cancelled';
+    return 'current';
+  }
+
+  function deriveItemStatus(rawStatus, temporalState) {
+    var v = String(rawStatus || '').trim().toLowerCase();
+    if (['active', 'historical', 'completed', 'cancelled'].indexOf(v) !== -1) return v;
+    if (temporalState === 'past') return 'historical';
+    if (temporalState === 'completed') return 'completed';
+    if (temporalState === 'cancelled') return 'cancelled';
+    return 'active';
+  }
+
   function parseStructuredMemoryResponse(rawText) {
     var parsed = parseExtractorJsonObject(rawText);
     if (!parsed) return { intent: 'none', items: [], clarificationQuestion: '' };
@@ -1128,6 +1335,7 @@
       topIntent === 'update' ||
       topIntent === 'delete' ||
       topIntent === 'add' ||
+      topIntent === 'mark_historical' ||
       parsed.shouldSave === true ||
       typeof parsed.content === 'string'
     ) {
@@ -1159,7 +1367,7 @@
     var userId = String(ctx.userId || 'local_user').trim() || 'local_user';
     var items = Array.isArray(decision && decision.items) ? decision.items : [];
     var isExplicit = !!ctx.isExplicit;
-    var minConf = isExplicit ? 0.55 : 0.58;
+    var minConf = isExplicit ? 0.55 : 0.60;
 
     if (decision && decision.intent === 'clarify') {
       return {
@@ -1175,10 +1383,11 @@
       };
     }
 
+    var REJECTED_FACT_TYPES = ['guess', 'hypothesis', 'joke', 'sarcasm', 'third_party', 'quote', 'speculation', 'temporary', 'greeting_or_temp'];
+
     if (!isExplicit && decision) {
       var topFactType = String(decision.factType || '').toLowerCase();
-      if (decision.aboutUser === false || decision.isDurable === false ||
-          topFactType === 'guess' || topFactType === 'hypothesis' || topFactType === 'quote' || topFactType === 'temporary' || topFactType === 'greeting_or_temp') {
+      if (decision.aboutUser === false || decision.isDurable === false || REJECTED_FACT_TYPES.indexOf(topFactType) !== -1) {
         return {
           added: [],
           updated: [],
@@ -1189,7 +1398,11 @@
           blockedDeleted: 0,
           valueRejectReason: decision.aboutUser === false
             ? '非用户本人直接事实'
-            : (topFactType === 'guess' || topFactType === 'hypothesis' ? '猜测或假设内容' : (topFactType === 'quote' ? '引用他人内容' : '临时话题或不具持续性'))
+            : (topFactType === 'guess' || topFactType === 'hypothesis' || topFactType === 'speculation'
+              ? '猜测或假设内容'
+              : (topFactType === 'joke' || topFactType === 'sarcasm'
+                ? '玩笑或反讽表达'
+                : (topFactType === 'quote' || topFactType === 'third_party' ? '引用他人内容' : '临时话题或不具持续性')))
         };
       }
     }
@@ -1228,13 +1441,12 @@
         continue;
       }
 
+      var itemFactType = String(item.factType || (decision && decision.factType) || '').toLowerCase();
       if (!isExplicit) {
-        var itemFactType = String(item.factType || (decision && decision.factType) || '').toLowerCase();
-        if (item.aboutUser === false || item.isDurable === false ||
-            itemFactType === 'guess' || itemFactType === 'hypothesis' || itemFactType === 'quote' || itemFactType === 'temporary') {
+        if (item.aboutUser === false || item.isDurable === false || REJECTED_FACT_TYPES.indexOf(itemFactType) !== -1) {
           skipped++;
           rejectedByValueGate++;
-          rejectReasons.push('未通过持续性/用户直接事实价值评估');
+          rejectReasons.push('未通过可信度/用户直接事实价值评估');
           continue;
         }
       }
@@ -1286,13 +1498,57 @@
         continue;
       }
 
+      // 若模型仍输出未消解的模糊指代（如“刚才说的那个项目”），尝试结合上下文消解或要求澄清
+      if (hasVagueContextReference(content)) {
+        var resolved = resolveContextReferenceFromHistory(ctx.rawUserText || content, ctx.historyMessages || [], ctx.maxSingleMemoryLength);
+        if (resolved && resolved.content) {
+          content = resolved.content;
+          if (!item.factSource) item.factSource = 'context_resolved';
+          if (!item.category && resolved.category) item.category = resolved.category;
+        } else if (isExplicit) {
+          return {
+            added: [],
+            updated: [],
+            deleted: [],
+            skipped: 0,
+            rejectedByValueGate: 0,
+            blockedSecrets: 0,
+            blockedDeleted: 0,
+            needsClarification: true,
+            clarificationMessage: '我还不太确定你具体指的是哪一项内容，可以再说一下名称或细节吗？'
+          };
+        } else {
+          skipped++;
+          rejectedByValueGate++;
+          rejectReasons.push('指代对象未在上下文中明确，跳过保存');
+          continue;
+        }
+      }
+
+      var tState = normalizeItemTemporalState(item.temporalState, item.status);
+      var mStatus = deriveItemStatus(item.status, tState);
+      if (itemIntent === 'mark_historical' && mStatus === 'active') {
+        mStatus = 'historical';
+        tState = 'past';
+      }
+
+      var actionKind = (itemIntent === 'update' || itemIntent === 'mark_historical') ? 'update' : 'add';
+      var relationVal = String(item.relation || (actionKind === 'update' ? (mStatus !== 'active' ? 'status_changed' : 'updated') : 'new')).trim();
+
       toUpsert.push({
-        action: itemIntent === 'update' ? 'update' : 'add',
+        action: actionKind,
         targetId: String(item.targetId || ''),
+        targetSubject: String(item.targetSubject || '').trim(),
         content: content,
         category: item.category || inferMemoryCategoryFromText(content),
-        importance: item.importance != null ? item.importance : (isExplicit ? 5 : 4),
-        scope: item.scope || 'user'
+        importance: item.importance != null ? item.importance : (mStatus !== 'active' ? 2 : (isExplicit ? 5 : 4)),
+        scope: item.scope || 'user',
+        confidence: conf,
+        temporalState: tState,
+        status: mStatus,
+        factSource: String(item.factSource || (itemFactType === 'context_resolved' ? 'context_resolved' : 'user_statement')).trim(),
+        relation: relationVal,
+        supersedesId: String(item.supersedesId || '').trim()
       });
     }
 
@@ -1327,12 +1583,13 @@
     var userId = String(opts.userId || 'local_user').trim() || 'local_user';
     var existing = await store.listMemories({ userId: userId });
     var existingListText = existing.slice(0, 30).map(function(m) {
-      return '- id:' + m.id + ' | [' + m.category + '] ' + m.content;
+      var stTag = (m.status && m.status !== 'active') ? ('[' + m.status + '] ') : '';
+      return '- id:' + m.id + ' | ' + stTag + '[' + m.category + '] ' + m.content;
     }).join('\n') || '（暂无已有记忆）';
 
     var historyContextText = buildHistoryContextText(opts.historyMessages);
     var historyBlock = historyContextText
-      ? ('\n【近期聊天上下文（用于理解“刚才说的/这个/那个”等指代）】\n' + historyContextText + '\n')
+      ? ('\n【近期聊天上下文（必须用于消解“刚才说的/之前说的/那个项目/按这个来”等指代）】\n' + historyContextText + '\n')
       : '';
 
     var intentHintLine = opts.intentHint && opts.intentHint !== 'none'
@@ -1340,32 +1597,35 @@
       : '';
 
     var prompt =
-      '你是知屿的智能语义记忆判断器。请理解用户的真实意图（不要求固定句式），判断本轮对话应该执行哪种长期记忆操作。\n' +
+      '你是知屿的智能语义记忆判断器。请理解用户的真实意图、指代关系、时间状态与事实变化。\n' +
       '可选 intent：\n' +
-      '- "save": 新增值得跨对话长期保留的用户信息（偏好、习惯、长期计划、正在开发的项目、重要决定、身份背景，或用户明确要求记下/记忆一下/留个底/别忘了的内容）。\n' +
-      '- "update": 修改/修正/替代已有某条记忆（如偏好改变、从草莓改口芒果、换城市等），必须在 targetId 填入被替换的已有记忆 ID。\n' +
-      '- "delete": 用户要求忘掉、忘记、删除、取消某条记忆或不再保留某个偏好/事项，必须在 targetId 填入目标已有记忆 ID（如有多条全部匹配可放在 memories 数组中逐条返回）。\n' +
-      '- "clarify": 用户明确要求记住/修改/忘掉“这个/刚才说的”，但上下文中找不到明确可保存的对象时，绝不凭空猜测，返回 intent="clarify" 并填写 clarificationQuestion 询问用户。\n' +
-      '- "none": 普通寒暄（你好/谢谢）、纯通用知识问答、一次性琐事，或置信度较低不确定是否长期有效。\n\n' +
-      '严格规范：\n' +
-      '1) 绝不保存密码、API Key、Token、验证码、私钥、银行卡/证件号。\n' +
-      '2) 若与已有记忆完全重复，返回 intent="none", shouldSave=false。\n' +
-      '3) 请诚实评估 confidence（0~1 之间小数），不确定的内容给低置信度并保持保守。\n\n' +
+      '- "save": 新增值得跨对话长期保留的用户信息（偏好、习惯、长期计划、正在开发的项目、重要决定、身份背景，或用户要求记住/关注的内容）。\n' +
+      '- "update": 修改/修正/替代已有某条记忆，或把已取消/过去事项更新为历史/已取消状态（必须在 targetId 填入被更新的已有记忆 ID，或填写 targetSubject）。\n' +
+      '- "delete": 用户要求忘掉、忘记、删除某条记忆。\n' +
+      '- "clarify": 用户指代“这个/刚才说的”，但上下文找不到明确对象时，绝不凭空猜测，返回 intent="clarify"。\n' +
+      '- "none": 普通寒暄、一次性提问、假设/玩笑/他人事实且用户未要求保存。\n\n' +
+      '深度语义规范：\n' +
+      '1) 多事实拆解：一句话含多个独立信息（如正在开发某项目 + 开始学习某语言），必须拆成 memories 数组多条返回。\n' +
+      '2) 指代消解：若用户说“刚才说的那个项目/计划/按这个来”，必须从【近期聊天上下文】提取具体名称写入 content（并标记 factSource="context_resolved"），绝不可保留“刚才说的”这种模糊词。\n' +
+      '3) 时间状态：区分 temporalState（"current"当前 / "past"过去 / "future_plan"计划 / "completed"已完成 / "cancelled"已取消）与 status（"active" / "historical" / "completed" / "cancelled"）。\n' +
+      '4) 若某旧计划已取消或旧偏好已成过去，应同时更新旧记忆为 historical/cancelled，不要把已取消或过去偏好标成 active。\n' +
+      '5) 绝不保存密码、API Key、Token、验证码、私钥、银行卡/证件号。\n' +
+      '6) 诚实评估 confidence（0~1），不确定或猜测给低分。\n\n' +
       intentHintLine +
       '【已有记忆】\n' + existingListText + '\n' +
       historyBlock + '\n' +
       '【本轮用户输入】\n' + String(opts.userText || '').slice(0, 1200) + '\n\n' +
       (opts.assistantText ? ('【本轮助手回复摘要】\n' + String(opts.assistantText).slice(0, 400) + '\n\n') : '') +
       '请只输出合法 JSON 对象，不要有任何多余文字：\n' +
-      '{"intent":"save","shouldSave":true,"content":"用第三人称简练概括，例如：用户最近开始学习日语","category":"长期计划","confidence":0.92,"targetId":"","clarificationQuestion":"","memories":[{"intent":"save","shouldSave":true,"content":"用户最近开始学习日语","category":"长期计划","confidence":0.92,"targetId":"","importance":4,"scope":"user"}]}';
+      '{"intent":"save","shouldSave":true,"aboutUser":true,"factType":"direct_fact","confidence":0.92,"clarificationQuestion":"","memories":[{"intent":"save","shouldSave":true,"content":"用户正在推进项目「星澜」","category":"项目","temporalState":"current","status":"active","factSource":"context_resolved","relation":"new","targetId":"","targetSubject":"","confidence":0.92,"importance":4,"scope":"user"}]}';
 
     var res = await ai.requestChatCompletion({
       apiConfig: opts.apiConfig,
       temperature: 0.1,
-      maxTokens: 1200,
+      maxTokens: 1500,
       allowReasoningFallback: true,
       messages: [
-        { role: 'system', content: '你是只输出纯 JSON 的智能语义记忆判断器。输出字段包括 intent(save/update/delete/clarify/none)、shouldSave、content、category、confidence、targetId 与 memories 数组。' },
+        { role: 'system', content: '你是只输出纯 JSON 的智能语义记忆判断器。支持多事实拆分、指代消解、temporalState/status 时间状态识别与事实变更关联。' },
         { role: 'user', content: prompt }
       ]
     });
@@ -1459,23 +1719,110 @@
       };
     }
 
-    // 3) 如果是软意图且无有效 API，退回普通聊天流程（不阻塞用户对话）
+    var capCheck = detectUnsupportedMonitoringOrReminderRequest(userText);
+
+    // 3) 如果是软意图且无有效 API：若有上下文指代且能消解，按规则尝试兜底；若明显缺上下文则澄清；否则退回普通聊天流程
     if (isSoft && (!opts.apiConfig || !opts.apiConfig.url || !opts.apiConfig.key || !opts.apiConfig.model)) {
-      return { isExplicit: false, intent: 'none', saved: false, added: [], updated: [], deleted: [] };
+      if (hasVagueContextReference(userText) && !hasIdentifiableHistoryAntecedent(historyMessages)) {
+        return {
+          isExplicit: true,
+          intent: 'clarify',
+          saved: false,
+          needsClarification: true,
+          clarificationMessage: '当前对话里还没有可以指代的前文，你想让我记住或关注哪件事呢？',
+          capabilityNotice: capCheck.capabilityNotice,
+          added: [],
+          updated: [],
+          deleted: []
+        };
+      }
+      var offlineResolved = resolveContextReferenceFromHistory(userText, historyMessages, params.maxSingleMemoryLength);
+      if (offlineResolved && params.useMemory) {
+        var offlineUpsert = await upsertExtractedMemories([offlineResolved], {
+          userId: userId,
+          chatId: chatId,
+          chatTitle: chatTitle,
+          projectId: projectId,
+          rawUserText: userText,
+          maxSingleMemoryLength: params.maxSingleMemoryLength,
+          taskCreatedAt: turnCreatedAt,
+          allowOverrideOlderTombstone: true,
+          isExplicit: true
+        });
+        var offIds = (offlineUpsert.added || []).concat(offlineUpsert.updated || []).map(function(m) { return m && m.id; }).filter(Boolean);
+        return {
+          isExplicit: true,
+          intent: 'save',
+          saved: offIds.length > 0,
+          alreadyExists: !offIds.length && !!offlineUpsert.skipped,
+          capabilityNotice: capCheck.capabilityNotice,
+          added: offlineUpsert.added || [],
+          updated: offlineUpsert.updated || [],
+          deleted: [],
+          savedIds: offIds
+        };
+      }
+      return {
+        isExplicit: false,
+        intent: 'none',
+        saved: false,
+        capabilityNotice: capCheck.capabilityNotice,
+        added: [],
+        updated: [],
+        deleted: []
+      };
     }
 
     // 4) 若属于软意图表达，先调用模型确认到底是不是记忆意图；若模型判定为 none，交回普通聊天
     if (isSoft) {
       try {
+        if (hasVagueContextReference(userText) && !hasIdentifiableHistoryAntecedent(historyMessages)) {
+          return {
+            isExplicit: true,
+            intent: 'clarify',
+            saved: false,
+            needsClarification: true,
+            clarificationMessage: '当前对话里还没有可以指代的前文，你想让我记住或关注哪件事呢？',
+            capabilityNotice: capCheck.capabilityNotice,
+            added: [],
+            updated: [],
+            deleted: []
+          };
+        }
+
         var softDecision = await requestSemanticMemoryJudgment({
           userText: userText,
           historyMessages: historyMessages,
           userId: userId,
           apiConfig: opts.apiConfig,
-          intentHint: 'none'
+          intentHint: capCheck.needsCapabilityCheck ? 'save' : 'none'
         });
+
+        if ((!softDecision || softDecision.intent === 'none') && hasVagueContextReference(userText)) {
+          var ctxFallback = resolveContextReferenceFromHistory(userText, historyMessages, params.maxSingleMemoryLength);
+          if (ctxFallback) {
+            softDecision = {
+              intent: 'save',
+              shouldSave: true,
+              aboutUser: true,
+              isDurable: true,
+              factType: 'direct_fact',
+              confidence: ctxFallback.confidence,
+              items: [ctxFallback]
+            };
+          }
+        }
+
         if (!softDecision || softDecision.intent === 'none') {
-          return { isExplicit: false, intent: 'none', saved: false, added: [], updated: [], deleted: [] };
+          return {
+            isExplicit: false,
+            intent: 'none',
+            saved: false,
+            capabilityNotice: capCheck.capabilityNotice,
+            added: [],
+            updated: [],
+            deleted: []
+          };
         }
         if (softDecision.intent === 'clarify') {
           return {
@@ -1484,6 +1831,7 @@
             saved: false,
             needsClarification: true,
             clarificationMessage: softDecision.clarificationQuestion || '你想让我记住或修改哪一条内容呢？请再具体说明一下。',
+            capabilityNotice: capCheck.capabilityNotice,
             added: [],
             updated: [],
             deleted: []
@@ -1496,6 +1844,7 @@
             saved: false,
             blockedBySetting: true,
             reason: '长期记忆已关闭，本次未保存',
+            capabilityNotice: capCheck.capabilityNotice,
             added: [],
             updated: [],
             deleted: []
@@ -1523,6 +1872,7 @@
           chatTitle: chatTitle,
           projectId: projectId,
           rawUserText: userText,
+          historyMessages: historyMessages,
           maxSingleMemoryLength: params.maxSingleMemoryLength,
           taskCreatedAt: turnCreatedAt,
           allowOverrideOlderTombstone: true,
@@ -1541,6 +1891,7 @@
             saved: false,
             needsClarification: true,
             clarificationMessage: softApplied.clarificationMessage,
+            capabilityNotice: capCheck.capabilityNotice,
             added: [],
             updated: [],
             deleted: []
@@ -1569,13 +1920,50 @@
           deletedCount: sDeleted.length,
           alreadyExists: !sChanged && !!softApplied.skipped,
           reason: sSummary,
+          capabilityNotice: capCheck.capabilityNotice,
           added: sAdded,
           updated: sUpdated,
           deleted: sDeleted,
           savedIds: sIds
         };
       } catch (softErr) {
-        return { isExplicit: false, intent: 'none', saved: false, added: [], updated: [], deleted: [] };
+        if (hasVagueContextReference(userText) && hasIdentifiableHistoryAntecedent(historyMessages) && params.useMemory) {
+          var errFallbackItem = resolveContextReferenceFromHistory(userText, historyMessages, params.maxSingleMemoryLength);
+          if (errFallbackItem) {
+            var errUpsert = await upsertExtractedMemories([errFallbackItem], {
+              userId: userId,
+              chatId: chatId,
+              chatTitle: chatTitle,
+              projectId: projectId,
+              rawUserText: userText,
+              maxSingleMemoryLength: params.maxSingleMemoryLength,
+              taskCreatedAt: turnCreatedAt,
+              allowOverrideOlderTombstone: true,
+              isExplicit: true
+            });
+            var errIds = (errUpsert.added || []).concat(errUpsert.updated || []).map(function(m) { return m && m.id; }).filter(Boolean);
+            return {
+              isExplicit: true,
+              intent: 'save',
+              saved: errIds.length > 0,
+              alreadyExists: !errIds.length && !!errUpsert.skipped,
+              capabilityNotice: capCheck.capabilityNotice,
+              added: errUpsert.added || [],
+              updated: errUpsert.updated || [],
+              deleted: [],
+              savedIds: errIds
+            };
+          }
+        }
+        return {
+          isExplicit: false,
+          intent: 'none',
+          saved: false,
+          capabilityNotice: capCheck.capabilityNotice,
+          added: [],
+          updated: [],
+          deleted: []
+        };
       }
     }
 
@@ -1783,6 +2171,7 @@
           chatTitle: chatTitle,
           projectId: projectId,
           rawUserText: userText,
+          historyMessages: historyMessages,
           maxSingleMemoryLength: params.maxSingleMemoryLength,
           taskCreatedAt: turnCreatedAt,
           allowOverrideOlderTombstone: true,
@@ -1801,6 +2190,7 @@
             saved: false,
             needsClarification: true,
             clarificationMessage: writeRes.clarificationMessage,
+            capabilityNotice: capCheck.capabilityNotice,
             added: [],
             updated: [],
             deleted: []
@@ -1831,6 +2221,7 @@
           intent: fast.intent,
           saved: hasWritten,
           deletedCount: deletedFromUpdate.length,
+          capabilityNotice: capCheck.capabilityNotice,
           added: added,
           updated: updated,
           deleted: deletedFromUpdate,
@@ -1930,19 +2321,27 @@
     return true;
   }
 
+  function containsJokeOrSarcasm(text) {
+    var src = String(text || '').trim();
+    if (!src) return false;
+    return /(?:开玩笑|开个玩笑|逗你玩|逗你的|瞎说的|胡说的|吹牛|搞笑|狗头|\/s\b|骗你的|才怪|哪有那么多|哈哈哈哈)/.test(src);
+  }
+
   function isGuessHypothesisOrThirdPartyQuote(text) {
     var src = String(text || '').trim();
     if (!src) return false;
+    if (containsJokeOrSarcasm(src)) return true;
+
     // 明确假设/猜测语气
-    if (/^(?:如果|假如|假设|万一|要是我|设想|比方说|比如我|大概|也许|可能只是|说不定|随便说说|开玩笑地说)/.test(src)) {
+    if (/^(?:如果|假如|假设|万一|要是我|设想|比方说|比如我|试想|要是有一天|大概|也许|可能只是|说不定|随便说说|开玩笑地说)/.test(src)) {
       return true;
     }
-    if (/(?:如果|假如|假设|万一).{0,24}(?:的话|怎么办|会怎样|岂不是)/.test(src)) {
+    if (/(?:如果|假如|假设|万一).{0,30}(?:的话|怎么办|会怎样|岂不是|……|\.\.\.)/.test(src)) {
       return true;
     }
-    // 明确引用他人/书本/网上内容且未声明用户本人事实
-    if (/^(?:他|她|它|我朋友|朋友|同事|同学|我妈|我爸|家人|老板|别人|网友|书里|小说里|文章里|老师|客户|听说)/.test(src) &&
-        !/(?:但我|不过我|我也|而我)(?:喜欢|偏好|习惯|正在|打算|计划|决定)/.test(src)) {
+    // 明确引用他人/书本/网上内容，若不含本人转折对比则拦截
+    if (/^(?:他|她|它|他们|她们|我朋友|朋友|我同事|同事|我同学|同学|我室友|室友|我闺蜜|闺蜜|我哥|我姐|我弟|我妹|我妈|我爸|我老公|我老婆|我对象|男朋友|女朋友|家人|老板|领导|客户|别人|大家|有人|网友|书里|小说里|文章里|老师|听说|据(?:说|了解|悉))/.test(src) &&
+        !/(?:但我|不过我|我也|而我|我自己)(?:更|比较|最)?(?:喜欢|偏好|习惯|正在|打算|计划|决定|开始)/.test(src)) {
       return true;
     }
     return false;
@@ -1960,47 +2359,151 @@
     if (!src || src.length < 4) return [];
     if (containsSensitiveSecret(src) || containsHighRiskPrivacy(src)) return [];
     if (isPureGreetingOrFiller(src) || isPureQuestionWithoutFact(src)) return [];
-    if (isGuessHypothesisOrThirdPartyQuote(src)) return [];
+    if (containsJokeOrSarcasm(src)) return [];
 
-    var clauses = src.split(/[。；;！!\n]+/).map(function(s) { return s.trim(); }).filter(Boolean);
+    // 整句纯假设且不包含实际转折事实时直接跳过
+    if (/^(?:如果|假如|假设|万一|要是我|设想|比方说|比如我|试想|要是有一天)/.test(src)) return [];
+    if (/(?:如果|假如|假设|万一).{0,30}(?:的话|怎么办|会怎样|岂不是|……|\.\.\.)/.test(src) && !/(?:但我|其实我|我现在)/.test(src)) {
+      return [];
+    }
+
     var limit = Math.max(60, Number(maxLen) || DEFAULT_MAX_MEM_LENGTH);
     var out = [];
     var seen = new Set();
 
-    function pushCandidate(content, category, importance) {
+    function pushCandidate(content, category, importance, extra) {
       var text = String(content || '').replace(/[。！!]+$/, '').trim();
       if (!text || text.length < 4) return;
       if (text.length > limit) text = text.slice(0, limit);
       var norm = normalizeMemoryText(text);
-      if (!norm || seen.has(norm)) return;
-      seen.add(norm);
-      out.push({
-        intent: 'save',
-        action: 'add',
+      var ex = extra && typeof extra === 'object' ? extra : {};
+      var dedupKey = norm + '|' + (ex.status || 'active') + '|' + (ex.temporalState || 'current');
+      if (!norm || seen.has(dedupKey)) return;
+      seen.add(dedupKey);
+      out.push(Object.assign({
+        intent: ex.action === 'update' ? 'update' : 'save',
+        action: ex.action || 'add',
         shouldSave: true,
         aboutUser: true,
         isDurable: true,
         factType: 'direct_fact',
+        factSource: 'user_statement',
+        temporalState: 'current',
+        status: 'active',
+        relation: 'new',
+        targetSubject: '',
         confidence: 0.9,
         content: text,
         category: category,
         importance: importance || 4,
         scope: 'user',
         via: 'high_certainty_rule'
-      });
+      }, ex));
     }
 
-    for (var i = 0; i < clauses.length; i++) {
-      var cl = clauses[i];
+    // 先按整句提取跨分句语义转折（过去 vs 现在、原计划 vs 取消、已完成）
+    var sentenceUnits = src.split(/[。；;！!\n]+/).map(function(s) { return s.trim(); }).filter(Boolean);
+    var remainingClauses = [];
+
+    for (var si = 0; si < sentenceUnits.length; si++) {
+      var sent = sentenceUnits[si];
+      if (!sent || sent.length < 4) continue;
+      if (isGuessHypothesisOrThirdPartyQuote(sent) && !/(?:但我|不过我|我也|而我)/.test(sent)) continue;
+
+      // Case B: 「我以前喜欢草莓，现在更喜欢芒果」/「之前爱喝美式，现在改喝拿铁」
+      var mPastNow = sent.match(/^(?:我|本人)(?:以前|之前|曾经|过去|原本)(?:比较|最)?(喜欢|偏爱|偏好|爱吃|爱喝|习惯)([^，,；;]{1,28}?)[，,；;]+\s*(?:但|不过|可是|而)?(?:现在|如今|目前|后来)(?:我)?(?:也|其实)?(更喜欢|改喜欢|更爱吃|更爱喝|改喝|改吃|喜欢|偏爱|偏好|爱吃|爱喝|习惯)([^，,；;]{1,28})/);
+      if (mPastNow && mPastNow[2] && mPastNow[4]) {
+        var oldVerb = mPastNow[1];
+        var oldObj = cleanHighCertaintyClauseTail(mPastNow[2]);
+        var newVerb = mPastNow[3];
+        var newObj = cleanHighCertaintyClauseTail(mPastNow[4]);
+        if (oldObj && newObj && oldObj !== newObj) {
+          pushCandidate('用户以前' + oldVerb + oldObj, inferMemoryCategoryFromText(oldVerb + oldObj), 2, {
+            action: 'update',
+            temporalState: 'past',
+            status: 'historical',
+            relation: 'status_changed',
+            targetSubject: oldObj
+          });
+          pushCandidate('用户现在' + newVerb + newObj, inferMemoryCategoryFromText(newVerb + newObj), 5, {
+            action: 'add',
+            temporalState: 'current',
+            status: 'active',
+            relation: 'updated',
+            targetSubject: oldObj
+          });
+          continue;
+        }
+      }
+
+      // Case F: 「我原来准备学习法语，但现在取消了」/「之前打算考驾照，现在放弃了」
+      var mCancel = sent.match(/^(?:我|本人)(?:原来|本来|之前|原本|先前)(?:准备|打算|计划|想|想要)(?:长期)?([^，,；;]{2,36}?)[，,；;]+\s*(?:但|不过|但是|可是)?(?:现在|如今|目前|已经)?(?:取消了?|放弃了?|不打算了?|不学了?|不做了?|作罢了?|搁置了?)$/);
+      if (mCancel && mCancel[1]) {
+        var planTarget = cleanHighCertaintyClauseTail(mCancel[1]);
+        if (planTarget) {
+          pushCandidate('用户原计划' + planTarget + '，现已取消', inferMemoryCategoryFromText('计划' + planTarget), 2, {
+            action: 'update',
+            temporalState: 'cancelled',
+            status: 'cancelled',
+            relation: 'status_changed',
+            targetSubject: planTarget
+          });
+          continue;
+        }
+      }
+
+      // 已完成事项：「我之前计划的XX已经完成了」
+      var mDone = sent.match(/^(?:我|本人)(?:之前|原本|原来)?(?:准备|打算|计划)的?([^，,；;]{2,36}?)[，,；;]*?(?:已经|现已)(?:完成了?|考完了?|通过了?|做完了?|搞定了?)$/);
+      if (mDone && mDone[1]) {
+        var doneTarget = cleanHighCertaintyClauseTail(mDone[1]);
+        if (doneTarget) {
+          pushCandidate('用户已完成原计划：' + doneTarget, inferMemoryCategoryFromText('计划' + doneTarget), 2, {
+            action: 'update',
+            temporalState: 'completed',
+            status: 'completed',
+            relation: 'status_changed',
+            targetSubject: doneTarget
+          });
+          continue;
+        }
+      }
+
+      // 否则按逗号拆成多个独立子句处理（支持多事实提取：如「我正在开发知屿，最近还开始学习日语」）
+      var subClauses = sent.split(/[，,]+/).map(function(x) { return x.trim(); }).filter(Boolean);
+      var sentHasSelf = /^(?:我|本人)/.test(sent) || /(?:但我|不过我|而我|我也)/.test(sent);
+      for (var sc = 0; sc < subClauses.length; sc++) {
+        remainingClauses.push({ text: subClauses[sc], sentHasSelf: sentHasSelf });
+      }
+    }
+
+    for (var i = 0; i < remainingClauses.length; i++) {
+      var entry = remainingClauses[i];
+      var cl = entry.text;
       if (!cl || cl.length < 4) continue;
+
+      // 剥离“但我/不过我/而我”转折连接词
+      cl = cl.replace(/^(?:但|不过|可是|而)(?=(?:我|本人))/, '').trim();
       if (isClauseQuestion(cl) || isGuessHypothesisOrThirdPartyQuote(cl)) continue;
+
+      // 若同一句前文主语是“我”，后续子句省略“我”（如「最近还开始学习日语」「同时也在准备考研」），补回“我”
+      var hasThirdPartyPrefix = /^(?:他|她|它|我朋友|朋友|同事|同学|室友|闺蜜|我妈|我爸|家人|老板|别人|网友|老师|客户)/.test(cl);
+      if (entry.sentHasSelf && !hasThirdPartyPrefix && !/^(?:我|本人)/.test(cl)) {
+        var normSub = cl
+          .replace(/^(?:并且|而且|同时|此外|另外|然后|以及)\s*/, '')
+          .replace(/^(最近|目前|现在|以后|今后|往后|平时|一直|本来|原来)\s*(?:还|也)\s*/, '$1')
+          .replace(/^(?:还|也)\s*(?=(?:在|正在|开始|准备|打算|计划|决定|喜欢|偏爱|偏好|爱吃|爱喝|习惯|不吃|忌口|过敏))/, '')
+          .trim();
+        if (/^(?:最近|目前|现在|以后|今后|往后|平时|一直在|正在|开始|准备|打算|计划|决定|喜欢|偏爱|偏好|爱吃|爱喝|习惯|不吃|忌口|过敏)/.test(normSub)) {
+          cl = '我' + normSub;
+        }
+      }
 
       // 1) 持续学习 / 开始学习 / 长期学习计划
       var mStartLearn = cl.match(/^(?:我|本人)(?:最近|刚刚|刚|现在|这几天|这阵子)?(?:开始)(?:学习|学)([^，,。；;！!\n]{1,36})/);
       if (mStartLearn && mStartLearn[1]) {
         var subj1 = cleanHighCertaintyClauseTail(mStartLearn[1]);
         if (subj1 && !/^(?:怎么|什么|如何)/.test(subj1)) {
-          pushCandidate('用户最近开始学习' + subj1, '长期计划', 4);
+          pushCandidate('用户最近开始学习' + subj1, '长期计划', 4, { temporalState: 'current', status: 'active' });
           continue;
         }
       }
@@ -2010,7 +2513,11 @@
         var subj2 = cleanHighCertaintyClauseTail(mLongLearn[1]);
         if (subj2 && !/^(?:怎么|什么|如何)/.test(subj2)) {
           var hasLongPrefix = /以后|长期|今后|往后/.test(cl);
-          pushCandidate(hasLongPrefix ? ('用户以后准备长期学习' + subj2) : ('用户计划学习' + subj2), '长期计划', 4);
+          pushCandidate(hasLongPrefix ? ('用户以后准备长期学习' + subj2) : ('用户计划学习' + subj2), '长期计划', 4, {
+            temporalState: 'future_plan',
+            status: 'active',
+            targetSubject: '学习' + subj2
+          });
           continue;
         }
       }
@@ -2019,36 +2526,36 @@
       if (mOngoingLearn && mOngoingLearn[1]) {
         var subj3 = cleanHighCertaintyClauseTail(mOngoingLearn[1]);
         if (subj3) {
-          pushCandidate('用户正在持续学习' + subj3, '长期计划', 4);
+          pushCandidate('用户正在持续学习' + subj3, '长期计划', 4, { temporalState: 'current', status: 'active' });
           continue;
         }
       }
 
-      // 2) 正在进行的项目
+      // 2) 正在进行的项目（支持「我正在开发知屿」等直接项目名）
       var mProject = cl.match(/^(?:我|本人)(?:目前|现在|最近)?(?:正在|在)(?:开发|制作|研发|搭建|编写|筹备|推进)([^，,。；;！!\n]{2,48})/);
       if (mProject && mProject[1]) {
         var projTail = cleanHighCertaintyClauseTail(mProject[1]);
-        if (projTail && /(?:软件|应用|app|工具|系统|网站|项目|产品|插件|小程序|游戏|脚本|模型|工作空间|名叫|叫做)/i.test(cl)) {
+        if (projTail && projTail.length >= 2 && !/(?:什么|哪个|怎么|如何|问题|报错|bug)/i.test(projTail)) {
           var verbMatch = cl.match(/(开发|制作|研发|搭建|编写|筹备|推进)/);
           var verb = verbMatch ? verbMatch[1] : '开发';
-          pushCandidate('用户正在' + verb + projTail, '项目', 4);
+          pushCandidate('用户正在' + verb + projTail, '项目', 4, { temporalState: 'current', status: 'active' });
           continue;
         }
       }
 
       // 3) 长期偏好与习惯（回答风格、饮食偏好、常用工具等）
-      var mPref = cl.match(/^(?:我|本人)(?:平时|一般|通常|向来|一直)?(?:比较|更|最)?(?:喜欢|偏爱|偏好|爱吃|爱喝|习惯|倾向于)([^，,。；;！!\n]{2,45})/);
+      var mPref = cl.match(/^(?:我|本人)(?:平时|一般|通常|向来|一直|现在)?(?:比较|更|最)?(?:喜欢|偏爱|偏好|爱吃|爱喝|习惯|倾向于|改喝|改吃)([^，,。；;！!\n]{2,45})/);
       if (mPref && mPref[1] && !/(?:今天|昨天|刚才|那部|那个电影|这首)/.test(cl)) {
         var prefFull = convertFirstPersonToThirdPerson(cl.replace(/[。！!]+$/, ''));
         var prefCat = /平时|每天|每晚|作息|早起|熬夜/.test(cl) && !/喜欢|偏爱|偏好/.test(cl) ? '习惯' : '偏好';
-        pushCandidate(prefFull, prefCat, 4);
+        pushCandidate(prefFull, prefCat, 4, { temporalState: 'current', status: 'active' });
         continue;
       }
 
       // 4) 忌口 / 过敏 / 长期不吃不喝
       var mAvoid = cl.match(/^(?:我|本人)(?:平时|向来|一直)?(?:不吃|忌口|过敏|讨厌|不爱吃|不爱喝|不喜欢吃|不喜欢喝)([^，,。；;！!\n]{1,32})/);
       if (mAvoid && mAvoid[1]) {
-        pushCandidate(convertFirstPersonToThirdPerson(cl.replace(/[。！!]+$/, '')), '偏好', 4);
+        pushCandidate(convertFirstPersonToThirdPerson(cl.replace(/[。！!]+$/, '')), '偏好', 4, { temporalState: 'current', status: 'active' });
         continue;
       }
 
@@ -2056,7 +2563,10 @@
       var mGoal = cl.match(/^(?:我|本人)(?:的长期目标是|长期目标是|已经决定|决定以后|计划以后|打算以后)([^，,。；;！!\n]{2,45})/);
       if (mGoal && mGoal[1]) {
         var goalText = convertFirstPersonToThirdPerson(cl.replace(/[。！!]+$/, ''));
-        pushCandidate(goalText, /决定/.test(cl) ? '决定' : '长期计划', 4);
+        pushCandidate(goalText, /决定/.test(cl) ? '决定' : '长期计划', 4, {
+          temporalState: /决定/.test(cl) ? 'current' : 'future_plan',
+          status: 'active'
+        });
       }
     }
 
@@ -2081,6 +2591,10 @@
 
     if (isPureQuestionWithoutFact(text)) {
       return { shouldExtract: false, reason: 'pure_question', label: '一次性提问且无用户长期事实，无需保存' };
+    }
+
+    if (containsJokeOrSarcasm(text)) {
+      return { shouldExtract: false, reason: 'joke_or_sarcasm', label: '属于玩笑或反讽表达，不作为长期记忆保存' };
     }
 
     if (isGuessHypothesisOrThirdPartyQuote(text)) {
@@ -2113,9 +2627,25 @@
     return '';
   }
 
+  function extractPlanOrProjectSlot(content) {
+    var src = String(content || '').trim();
+    var mPlan = src.match(/(?:原计划|计划|打算|准备|开始|持续|已完成原计划：?)(?:长期)?(学习|学|考|推进|开发|筹备)?([\u4e00-\u9fa5A-Za-z0-9_+#-]{2,20}?)(?:，现已取消|已完成|$)/);
+    if (mPlan && mPlan[2]) {
+      return 'plan_slot:' + String((mPlan[1] || '') + mPlan[2]).toLowerCase();
+    }
+    var mProj = src.match(/(?:正在|推进|开发|制作|研发)(?:项目[「:]?)?([\u4e00-\u9fa5A-Za-z0-9_+#-]{2,20}?)(?:[」]|（|$)/);
+    if (mProj && mProj[1]) {
+      return 'project_slot:' + mProj[1].toLowerCase();
+    }
+    return '';
+  }
+
   function detectMutualSlot(content, category) {
     var dynSlot = extractPreferenceSubjectSlot(content);
     if (dynSlot) return dynSlot;
+
+    var planSlot = extractPlanOrProjectSlot(content);
+    if (planSlot) return planSlot;
 
     var lower = String(content || '').toLowerCase();
     for (var i = 0; i < MUTUAL_SLOTS.length; i++) {
@@ -2130,12 +2660,38 @@
     return '';
   }
 
-  function findContradictionOrMergeTarget(content, category, sameScopeMemories, rawUserText) {
+  function findContradictionOrMergeTarget(content, category, sameScopeMemories, rawUserText, itemMeta) {
+    var meta = itemMeta && typeof itemMeta === 'object' ? itemMeta : {};
+    var incomingStatus = String(meta.status || 'active').toLowerCase();
+    var incomingTemporal = String(meta.temporalState || 'current').toLowerCase();
+    var targetSubject = String(meta.targetSubject || '').trim();
     var slot = detectMutualSlot(content, category);
-    var hasChangeCue = /(?:改成|改为|换成|换喝|改喝|改吃|不再|以前.*现在|转成|其实更喜欢|现在更喜欢|以后我更喜欢|平时更喜欢|更偏向)/.test(String(content || '') + ' ' + String(rawUserText || ''));
+    var hasChangeCue = /(?:改成|改为|换成|换喝|改喝|改吃|不再|以前.*现在|转成|其实更喜欢|现在更喜欢|以后我更喜欢|平时更喜欢|更偏向|取消了?|放弃了?|不学了?|完成了?)/.test(String(content || '') + ' ' + String(rawUserText || ''));
+
+    // 1) 若携带明确的变更主题（如“草莓”或“学习法语”）且意图为转历史/取消/完成，优先匹配尚未处于相同终态的同名记忆
+    if (targetSubject) {
+      var subjNorm = normalizeMemoryText(targetSubject);
+      var subjMatches = sameScopeMemories.filter(function(m) {
+        var mNorm = normalizeMemoryText(m.content);
+        if (!subjNorm || mNorm.indexOf(subjNorm) === -1) return false;
+        if (incomingStatus !== 'active') return true;
+        return (m.status || 'active') === 'active';
+      });
+      if (subjMatches.length > 0 && (incomingStatus !== 'active' || incomingTemporal !== 'current' || normalizeMemoryText(content).indexOf(subjNorm) !== -1)) {
+        subjMatches.sort(function(a, b) {
+          return (b.updatedAt || 0) - (a.updatedAt || 0);
+        });
+        return subjMatches[0];
+      }
+    }
+
+    // 2) 若当前新条目是 active，不主动覆盖已经标为 historical/cancelled/completed 的历史记录
+    var candidatePool = incomingStatus === 'active'
+      ? sameScopeMemories.filter(function(m) { return !m.status || m.status === 'active'; })
+      : sameScopeMemories;
 
     if (slot) {
-      var slotMatches = sameScopeMemories.filter(function(m) {
+      var slotMatches = candidatePool.filter(function(m) {
         return detectMutualSlot(m.content, m.category) === slot;
       });
       if (slotMatches.length > 0) {
@@ -2148,6 +2704,7 @@
         if (
           hasChangeCue ||
           slot.indexOf('pref_subject:') === 0 ||
+          slot.indexOf('plan_slot:') === 0 ||
           slot === 'coffee_drink' ||
           slot === 'reply_style' ||
           slot === 'user_location' ||
@@ -2160,12 +2717,12 @@
 
     var bestSim = 0;
     var bestTarget = null;
-    for (var j = 0; j < sameScopeMemories.length; j++) {
-      var sim = computeTextSimilarity(content, sameScopeMemories[j].content);
+    for (var j = 0; j < candidatePool.length; j++) {
+      var sim = computeTextSimilarity(content, candidatePool[j].content);
       if (sim > bestSim) {
         bestSim = sim;
         if (sim >= 0.62) {
-          bestTarget = sameScopeMemories[j];
+          bestTarget = candidatePool[j];
         }
       }
     }
@@ -2197,6 +2754,7 @@
     var skipped = 0;
     var blockedSecrets = 0;
     var blockedDeleted = 0;
+    var lastSupersededId = '';
 
     for (var i = 0; i < (Array.isArray(candidates) ? candidates.length : 0); i++) {
       var rawItem = candidates[i];
@@ -2237,57 +2795,85 @@
       if (scope !== 'user' && scope !== 'chat' && scope !== 'project') scope = 'user';
       if (scope === 'project' && !projectId) scope = 'user';
 
+      var temporalState = normalizeItemTemporalState(rawItem.temporalState, rawItem.status);
+      var memStatus = deriveItemStatus(rawItem.status, temporalState);
+      var itemConf = normalizeParsedConfidence(rawItem.confidence, 0.85);
+      var factSource = String(rawItem.factSource || 'user_statement').trim() || 'user_statement';
+
       var category = rawItem.category || inferMemoryCategoryFromText(content);
       var sameScopeMemories = existingAll.filter(function(m) {
         return m.scope === scope && (scope !== 'project' || m.projectId === projectId);
       });
 
       var matchedTarget = null;
-      if ((rawItem.action === 'update' || rawItem.intent === 'update') && rawItem.targetId) {
+      if ((rawItem.action === 'update' || rawItem.intent === 'update' || rawItem.intent === 'mark_historical') && rawItem.targetId) {
         matchedTarget = sameScopeMemories.find(function(m) { return m.id === rawItem.targetId; }) || null;
       }
 
       var normNew = normalizeMemoryText(content);
       var exactMatch = sameScopeMemories.find(function(m) {
-        return normalizeMemoryText(m.content) === normNew;
+        return normalizeMemoryText(m.content) === normNew &&
+          (m.status || 'active') === memStatus &&
+          (m.temporalState || 'current') === temporalState;
       });
       if (exactMatch) {
+        if (memStatus !== 'active') lastSupersededId = exactMatch.id;
         skipped++;
         continue;
       }
 
       if (!matchedTarget) {
-        matchedTarget = findContradictionOrMergeTarget(content, category, sameScopeMemories, rawUserText);
+        matchedTarget = findContradictionOrMergeTarget(content, category, sameScopeMemories, rawUserText, {
+          status: memStatus,
+          temporalState: temporalState,
+          targetSubject: rawItem.targetSubject || ''
+        });
       }
 
       if (matchedTarget) {
+        var updRelation = rawItem.relation || (memStatus !== 'active' ? 'status_changed' : 'updated');
         var upd = await store.updateMemory(matchedTarget.id, {
           content: content,
           category: category || matchedTarget.category,
-          importance: rawItem.importance != null ? rawItem.importance : matchedTarget.importance,
+          importance: rawItem.importance != null ? rawItem.importance : (memStatus !== 'active' ? 2 : matchedTarget.importance),
           sourceChatId: chatId || matchedTarget.sourceChatId,
-          sourceChatTitle: chatTitle || matchedTarget.sourceChatTitle
+          sourceChatTitle: chatTitle || matchedTarget.sourceChatTitle,
+          confidence: itemConf,
+          temporalState: temporalState,
+          status: memStatus,
+          factSource: factSource,
+          relation: updRelation,
+          supersedesId: rawItem.supersedesId || matchedTarget.supersedesId || ''
         });
         if (upd) {
           updated.push(upd);
+          if (memStatus !== 'active') lastSupersededId = upd.id;
           for (var u = 0; u < existingAll.length; u++) {
             if (existingAll[u].id === upd.id) existingAll[u] = upd;
           }
         }
       } else {
+        var linkedSupersedes = rawItem.supersedesId || (rawItem.relation === 'updated' && lastSupersededId ? lastSupersededId : '');
         var created = await store.createMemory({
           content: content,
           category: category,
-          importance: rawItem.importance != null ? rawItem.importance : 3,
+          importance: rawItem.importance != null ? rawItem.importance : (memStatus !== 'active' ? 2 : 3),
           scope: scope,
           sourceChatId: chatId,
           sourceChatTitle: chatTitle,
           userId: userId,
-          projectId: scope === 'project' ? projectId : ''
+          projectId: scope === 'project' ? projectId : '',
+          confidence: itemConf,
+          temporalState: temporalState,
+          status: memStatus,
+          factSource: factSource,
+          relation: rawItem.relation || 'new',
+          supersedesId: linkedSupersedes
         });
         if (created) {
           added.push(created);
           existingAll.unshift(created);
+          if (memStatus !== 'active') lastSupersededId = created.id;
         }
       }
     }
@@ -2414,33 +3000,37 @@
     var userId = String(opts.userId || 'local_user').trim() || 'local_user';
     var existing = await store.listMemories({ userId: userId });
     var existingListText = existing.slice(0, 28).map(function(m) {
-      return '- id:' + m.id + ' | [' + m.category + '] ' + m.content;
+      var stTag = (m.status && m.status !== 'active') ? ('[' + m.status + '] ') : '';
+      return '- id:' + m.id + ' | ' + stTag + '[' + m.category + '] ' + m.content;
     }).join('\n') || '（暂无已有记忆）';
 
     var historyContextText = buildHistoryContextText(opts.historyMessages);
     var historyBlock = historyContextText
-      ? ('\n【近期聊天上下文】\n' + historyContextText + '\n')
+      ? ('\n【近期聊天上下文（用于理解“刚才说的/之前说的/按这个来”等指代）】\n' + historyContextText + '\n')
       : '';
 
     var prompt =
-      '你是知屿的「主动长期记忆价值评估器」。在普通聊天中，无需用户说出“记住”二字，请主动判断用户这句话里是否包含值得跨会话长期保存的信息。\n\n' +
-      '【应该自动保存的高价值信息（务必积极识别）】\n' +
-      '1. 用户的长期偏好与习惯（如：喜欢简洁一点的回答、饮食口味偏好、常用语言/工具、作息习惯）。\n' +
-      '2. 用户正在进行的项目（如：正在开发一款名叫知屿的软件、正在写毕业论文、正在筹备某个产品）。\n' +
-      '3. 用户持续学习的内容（如：最近开始学习日语、准备长期学习编程、在备考某证书）。\n' +
-      '4. 用户的重要计划、长期目标与决定（如：以后准备长期学习编程、下月去某地出差、决定换技术栈）。\n' +
-      '5. 对未来聊天有帮助的稳定个人背景信息（职业、称呼、技能栈、长期约束）。\n\n' +
-      '【绝不保存的内容】\n' +
-      '1. 普通寒暄（你好、今天怎么样、晚安、谢谢）或一次性通用提问。\n' +
-      '2. 猜测、假设（如果/假如/也许）、他人经历或引述文章/朋友的话（非用户本人直接事实）。\n' +
+      '你是知屿的「主动长期记忆深度语义评估器」。在普通聊天中，请理解用户话语中的多事实、指代关系、时间语义、事实变化与事实可信度。\n\n' +
+      '【应该自动保存的高价值信息（务必独立拆解）】\n' +
+      '1. 多事实提取：如果一句话包含多个信息（例如「我正在开发知屿，最近还开始学习日语」），必须在 memories 数组中分别输出多条，绝不遗漏或合并成一条。\n' +
+      '2. 长期偏好与习惯（回答风格、饮食口味偏好、常用工具、作息习惯）。\n' +
+      '3. 正在进行的项目（如正在开发知屿）、持续学习的内容（如开始学习日语）、重要长期计划与决定。\n' +
+      '4. 上下文指代消解：如用户说「刚才说的那个项目/之前说的计划」，需从【近期聊天上下文】还原具体项目或计划名称写入 content（并标记 factSource="context_resolved"）。\n' +
+      '5. 时间与状态变化识别：\n' +
+      '   - 区分 temporalState("current"|"past"|"future_plan"|"completed"|"cancelled") 与 status("active"|"historical"|"completed"|"cancelled")。\n' +
+      '   - 例如「我以前喜欢草莓，现在更喜欢芒果」应分别记录过去偏好（status="historical", temporalState="past"）和当前偏好（status="active", temporalState="current", relation="updated"）。\n' +
+      '   - 例如「原来准备学习法语，但现在取消了」应更新原计划为 status="cancelled", temporalState="cancelled"（填入 targetId 或 targetSubject），不要保留为当前目标。\n\n' +
+      '【绝不保存的内容（可信度与价值把关）】\n' +
+      '1. 普通寒暄、一次性通用提问。\n' +
+      '2. 假设、猜测（如「假如我明年搬去东京……」）、玩笑反讽、他人事实（如「我朋友喜欢喝冰美式」）、未经确认的推测（factType 标记为 hypothesis/guess/joke/third_party/quote/speculation，aboutUser 设为 false，shouldSave 设为 false）。\n' +
       '3. 密码、API Key、验证码、身份证/银行卡、病历隐私等敏感信息。\n' +
-      '4. 与【已有记忆】完全重复的内容（但若用户明确改变旧偏好，请使用 intent="update" 并填入对应 targetId）。\n\n' +
+      '4. 与【已有记忆】完全重复且状态未变的内容。\n\n' +
       '【已有记忆】\n' + existingListText + '\n' +
       historyBlock + '\n' +
       '【本轮用户输入】\n' + String(opts.userText || '').slice(0, 1200) + '\n\n' +
       (opts.assistantText ? ('【本轮助手回复摘要】\n' + String(opts.assistantText).slice(0, 320) + '\n\n') : '') +
       '请只输出合法 JSON（不要多余解释）：\n' +
-      '{"shouldSave":true,"intent":"save","factType":"direct_fact","aboutUser":true,"isDurable":true,"confidence":0.92,"memories":[{"intent":"save","targetId":"","content":"用第三人称简练概括，例如：用户最近开始学习日语","category":"长期计划","importance":4,"confidence":0.92,"scope":"user"}]}';
+      '{"shouldSave":true,"intent":"save","factType":"direct_fact","aboutUser":true,"isDurable":true,"confidence":0.92,"memories":[{"intent":"save","targetId":"","targetSubject":"","content":"用户正在开发知屿","category":"项目","temporalState":"current","status":"active","factSource":"user_statement","relation":"new","importance":4,"confidence":0.92,"scope":"user"}]}';
 
     var res = await ai.requestChatCompletion({
       apiConfig: opts.apiConfig,
@@ -2448,7 +3038,7 @@
       maxTokens: 2048,
       allowReasoningFallback: false,
       messages: [
-        { role: 'system', content: '你是只输出合法 JSON 的主动记忆价值评估器。区分用户直接陈述(direct_fact)与猜测(guess)/假设(hypothesis)/引述他人(quote)/临时寒暄(greeting_or_temp)。' },
+        { role: 'system', content: '你是只输出合法 JSON 的深度语义记忆评估器。支持多事实拆解、时间状态(temporalState/status)、变更更新与严格过滤假设/玩笑/他人事实。' },
         { role: 'user', content: prompt }
       ]
     });
@@ -2499,22 +3089,31 @@
     }
 
     var userText = String(opts.userText || '').trim();
+    var capCheck = detectUnsupportedMonitoringOrReminderRequest(userText);
     var candidateCheck = analyzeMemoryCandidate(userText);
     if (candidateCheck.blockedSecret || candidateCheck.blockedPrivacy) {
       diag.skipStage = 'privacy_guard';
       diag.skipReason = candidateCheck.label || '敏感信息安全拦截';
-      return { added: [], updated: [], deleted: [], skipped: 0, blockedSecrets: 1, blockedDeleted: 0, diagnostics: diag };
+      return { added: [], updated: [], deleted: [], skipped: 0, blockedSecrets: 1, blockedDeleted: 0, capabilityNotice: capCheck.capabilityNotice, diagnostics: diag };
     }
     if (!candidateCheck.shouldExtract && !opts.forceExtract) {
       diag.skipStage = 'lightweight_filter';
       diag.skipReason = candidateCheck.label || candidateCheck.reason || '轻量筛选未命中长期记忆价值';
-      return { added: [], updated: [], deleted: [], skipped: 0, blockedSecrets: 0, blockedDeleted: 0, diagnostics: diag };
+      return { added: [], updated: [], deleted: [], skipped: 0, blockedSecrets: 0, blockedDeleted: 0, capabilityNotice: capCheck.capabilityNotice, diagnostics: diag };
     }
 
     var userId = String(opts.userId || 'local_user').trim() || 'local_user';
+    var historyMsgs = Array.isArray(opts.historyMessages) ? opts.historyMessages : [];
     var highCertaintyItems = !opts.forceExtract
       ? extractHighCertaintyFactCandidates(userText, params.maxSingleMemoryLength)
       : [];
+
+    if (!opts.forceExtract && highCertaintyItems.length === 0 && hasVagueContextReference(userText)) {
+      var resolvedCtxItem = resolveContextReferenceFromHistory(userText, historyMsgs, params.maxSingleMemoryLength);
+      if (resolvedCtxItem) {
+        highCertaintyItems.push(resolvedCtxItem);
+      }
+    }
 
     var decision = null;
     var hasUsableApi = !!(
@@ -2534,7 +3133,7 @@
       decision = await requestSemanticMemoryJudgment({
         userText: userText,
         assistantText: opts.assistantText || '',
-        historyMessages: opts.historyMessages || [],
+        historyMessages: historyMsgs,
         userId: userId,
         apiConfig: opts.apiConfig,
         intentHint: 'save'
@@ -2544,7 +3143,7 @@
       decision = await evaluateProactiveMemoryTurn({
         userText: userText,
         assistantText: opts.assistantText || '',
-        historyMessages: opts.historyMessages || [],
+        historyMessages: historyMsgs,
         userId: userId,
         apiConfig: opts.apiConfig
       });
@@ -2579,6 +3178,7 @@
       chatTitle: opts.chatTitle || '',
       projectId: opts.projectId || '',
       rawUserText: userText,
+      historyMessages: historyMsgs,
       maxSingleMemoryLength: params.maxSingleMemoryLength,
       taskCreatedAt: opts.taskCreatedAt || Date.now(),
       allowOverrideOlderTombstone: !!opts.allowOverrideOlderTombstone,
@@ -2587,31 +3187,46 @@
 
     var applyRes = await applyStructuredSemanticDecision(decision, writeCtx);
 
-    // 若模型因过于保守或返回为空未保存，但本地高确定性规则明确识别到用户本人的长期偏好/项目/持续学习事实，则用高确定性提取结果补救保存
-    var totalChangedByLlm = (applyRes.added ? applyRes.added.length : 0) + (applyRes.updated ? applyRes.updated.length : 0);
-    if (
-      !opts.forceExtract &&
-      totalChangedByLlm === 0 &&
-      !applyRes.blockedSecrets &&
-      !applyRes.blockedDeleted &&
-      highCertaintyItems.length > 0 &&
-      !(decision && (decision.aboutUser === false || decision.factType === 'guess' || decision.factType === 'hypothesis' || decision.factType === 'quote'))
-    ) {
-      var ruleDecision = {
-        intent: 'save',
-        shouldSave: true,
-        aboutUser: true,
-        isDurable: true,
-        factType: 'direct_fact',
-        confidence: 0.9,
-        items: highCertaintyItems
-      };
-      var ruleApply = await applyStructuredSemanticDecision(ruleDecision, writeCtx);
-      var ruleChanged = (ruleApply.added ? ruleApply.added.length : 0) + (ruleApply.updated ? ruleApply.updated.length : 0);
-      if (ruleChanged > 0 || ruleApply.skipped > 0 || ruleApply.blockedDeleted > 0 || ruleApply.blockedSecrets > 0) {
-        applyRes = ruleApply;
-        diag.candidateSource = 'high_certainty_rule';
-        if (!diag.candidateCount) diag.candidateCount = highCertaintyItems.length;
+    // 若模型漏掉多事实中的部分高确定性条目（或因过度保守返回为空），在不违背可信度与置信度判定前提下补全未覆盖的高确定性事实
+    var decisionRejectedCredibility = !!(
+      (applyRes && applyRes.rejectedByValueGate > 0) ||
+      (decision && (
+        decision.aboutUser === false ||
+        (decision.confidence != null && decision.confidence < 0.60) ||
+        ['guess', 'hypothesis', 'joke', 'sarcasm', 'third_party', 'quote', 'speculation'].indexOf(String(decision.factType || '').toLowerCase()) !== -1
+      ))
+    );
+    if (!opts.forceExtract && !applyRes.blockedSecrets && !applyRes.blockedDeleted && highCertaintyItems.length > 0 && !decisionRejectedCredibility) {
+      var savedCombined = (applyRes.added || []).concat(applyRes.updated || []);
+      var missingRuleItems = highCertaintyItems.filter(function(hc) {
+        return !savedCombined.some(function(sm) {
+          if (!sm || !sm.content) return false;
+          var sameStatus = (sm.status || 'active') === (hc.status || 'active');
+          return sameStatus && computeTextSimilarity(sm.content, hc.content) >= 0.52;
+        });
+      });
+
+      if (missingRuleItems.length > 0 && (savedCombined.length === 0 || missingRuleItems.length < highCertaintyItems.length || llmItems.length < highCertaintyItems.length)) {
+        var ruleDecision = {
+          intent: 'save',
+          shouldSave: true,
+          aboutUser: true,
+          isDurable: true,
+          factType: 'direct_fact',
+          confidence: 0.9,
+          items: missingRuleItems
+        };
+        var ruleApply = await applyStructuredSemanticDecision(ruleDecision, writeCtx);
+        var ruleChanged = (ruleApply.added ? ruleApply.added.length : 0) + (ruleApply.updated ? ruleApply.updated.length : 0);
+        if (ruleChanged > 0 || (savedCombined.length === 0 && (ruleApply.skipped > 0 || ruleApply.blockedDeleted > 0 || ruleApply.blockedSecrets > 0))) {
+          applyRes.added = (applyRes.added || []).concat(ruleApply.added || []);
+          applyRes.updated = (applyRes.updated || []).concat(ruleApply.updated || []);
+          applyRes.skipped = (applyRes.skipped || 0) + (ruleApply.skipped || 0);
+          applyRes.blockedDeleted = (applyRes.blockedDeleted || 0) + (ruleApply.blockedDeleted || 0);
+          applyRes.blockedSecrets = (applyRes.blockedSecrets || 0) + (ruleApply.blockedSecrets || 0);
+          diag.candidateSource = savedCombined.length > 0 ? 'llm+rule' : 'high_certainty_rule';
+          diag.candidateCount = Math.max(diag.candidateCount, highCertaintyItems.length);
+        }
       }
     }
 
@@ -2645,6 +3260,7 @@
       }
     }
 
+    applyRes.capabilityNotice = capCheck.capabilityNotice;
     applyRes.diagnostics = diag;
     return applyRes;
   }
@@ -3091,6 +3707,7 @@
     resolveMemoryParams: resolveMemoryParams,
     containsSensitiveSecret: containsSensitiveSecret,
     containsHighRiskPrivacy: containsHighRiskPrivacy,
+    containsJokeOrSarcasm: containsJokeOrSarcasm,
     normalizeMemoryText: normalizeMemoryText,
     computeTextSimilarity: computeTextSimilarity,
     filterAccessibleMemories: filterAccessibleMemories,
@@ -3100,7 +3717,10 @@
     summarizeChatSegment: summarizeChatSegment,
     detectMemoryIntentFast: detectMemoryIntentFast,
     detectExplicitMemoryCommand: detectExplicitMemoryCommand,
+    detectUnsupportedMonitoringOrReminderRequest: detectUnsupportedMonitoringOrReminderRequest,
     looksLikeSoftMemoryIntent: looksLikeSoftMemoryIntent,
+    hasVagueContextReference: hasVagueContextReference,
+    resolveContextReferenceFromHistory: resolveContextReferenceFromHistory,
     parseDirectExplicitMemoryFact: parseDirectExplicitMemoryFact,
     stripDeleteCommandTarget: stripDeleteCommandTarget,
     handleExplicitMemoryCommand: handleExplicitMemoryCommand,

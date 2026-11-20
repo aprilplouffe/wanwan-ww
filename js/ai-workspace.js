@@ -1706,6 +1706,17 @@
       }
     }
 
+    var capNotice = (explicitRes && explicitRes.capabilityNotice) || '';
+    if (!capNotice && M() && typeof M().detectUnsupportedMonitoringOrReminderRequest === 'function') {
+      var capProbe = M().detectUnsupportedMonitoringOrReminderRequest(text);
+      if (capProbe && capProbe.needsCapabilityCheck) {
+        capNotice = capProbe.capabilityNotice || '';
+      }
+    }
+    if (capNotice) {
+      memoryTurnNotice = memoryTurnNotice ? (memoryTurnNotice + '\n' + capNotice) : capNotice;
+    }
+
     _state.messages.push(assistantMsg);
     syncComposerButtons(page);
     updateMainStage(page);
